@@ -1,22 +1,35 @@
 import streamlit as st
 import pandas as pd
 import json
-import os
-from dotenv import load_dotenv
+from io import BytesIO
+
 from openai import OpenAI
 from qdrant_client import QdrantClient
 
 # =========================
-# CONFIG
+# STREAMLIT CONFIG
 # =========================
-load_dotenv()
+st.set_page_config(
+    page_title="MSM ESG Gap Engine",
+    layout="wide"
+)
 
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+st.title("MSM ESG KPI Gap Analysis Engine")
 
-KPI_FILE_PATH = r"C:\Users\WH327AH\OneDrive - EY\Desktop\MSM AI\Excel.xlsx"
+# =========================
+# SECRETS (STREAMLIT CLOUD)
+# =========================
+try:
+    QDRANT_URL = st.secrets["QDRANT_URL"]
+    QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+except KeyError:
+    st.error("Secrets not found. Please configure secrets in Streamlit Cloud.")
+    st.stop()
 
+# =========================
+# CLIENTS
+# =========================
 llm_client = OpenAI(api_key=OPENAI_API_KEY)
 
 qdrant_client = QdrantClient(
@@ -25,22 +38,20 @@ qdrant_client = QdrantClient(
     check_compatibility=False
 )
 
-st.set_page_config(page_title="MSM ESG Gap Engine", layout="wide")
-st.title("MSM ESG KPI Gap Analysis Engine")
-
 # =========================
-# EMBEDDINGS
+# EMBEDDING FUNCTIONS
 # =========================
-def embed_1536(text):
+def embed_1536(text: str):
     return llm_client.embeddings.create(
         model="text-embedding-3-small",
-        input=[text]
+        input=text
     ).data[0].embedding
 
-def embed_3072(text):
+
+def embed_3072(text: str):
     return llm_client.embeddings.create(
         model="text-embedding-3-large",
-        input=[text]
+        input=text
     ).data[0].embedding
 
 # =========================
@@ -49,23 +60,25 @@ def embed_3072(text):
 COLLECTION_CONFIG = {
     "esg_regulations": 1536,
     "esrs_e1": 1536,
-    "client_bor": 3072,
+    "client_bor": 3072
 }
 
 # =========================
-# RETRIEVE CONTEXT
+# RETRIEVE REGULATORY CONTEXT
 # =========================
-def retrieve_regulatory_context(query):
+def retrieve_regulatory_context(query: str) -> str:
 
     texts = []
 
-    for col, dim in COLLECTION_CONFIG.items():
+    for collection, dim in COLLECTION_CONFIG.items():
 
-        qvec = embed_3072(query) if dim == 3072 else embed_1536(query)
+        query_vector = (
+            embed_3072(query) if dim == 3072 else embed_1536(query)
+        )
 
         results = qdrant_client.query_points(
-            collection_name=col,
-            query=qvec,
+            collection_name=collection,
+            query=query_vector,
             limit=6
         )
 
@@ -76,17 +89,17 @@ def retrieve_regulatory_context(query):
                 or ""
             )
             if txt:
-                texts.append(f"[{col}] {txt}")
+                texts.append(f"[{collection}] {txt}")
 
     return "\n\n".join(texts)
 
 # =========================
-# GAP ANALYSIS
+# GAP ANALYSIS PROMPTS
 # =========================
 SYSTEM_PROMPT = """
 You are an ESG regulatory and carbon accounting expert.
 Use only regulatory context to determine feasibility.
-Return JSON only.
+Return strictly valid JSON only.
 """
 
 def run_gap_analysis(kpi_id, kpi_name, reg_text, schema_text):
@@ -123,7 +136,7 @@ Return JSON:
 }}
 """
 
-    resp = llm_client.chat.completions.create(
+    response = llm_client.chat.completions.create(
         model="gpt-5",
         temperature=0.1,
         messages=[
@@ -132,21 +145,27 @@ Return JSON:
         ]
     )
 
-    return resp.choices[0].message.content
+    return response.choices[0].message.content
 
 # =========================
-# READ KPI FILE AUTOMATICALLY
+# KPI FILE UPLOAD
 # =========================
-if not os.path.exists(KPI_FILE_PATH):
-    st.error("KPI Excel file not found at given path.")
+st.subheader("Upload KPI Master File")
+
+kpi_file = st.file_uploader(
+    "Upload KPI Excel",
+    type=["xlsx"]
+)
+
+if not kpi_file:
+    st.warning("Please upload KPI Excel file to proceed.")
     st.stop()
 
-kpi_df = pd.read_excel(KPI_FILE_PATH)
-
-st.success(f"KPI file loaded from: {KPI_FILE_PATH}")
+kpi_df = pd.read_excel(kpi_file)
+st.success("KPI file loaded successfully")
 
 # =========================
-# KPI DROPDOWN
+# KPI SELECTION
 # =========================
 selected_kpi = st.selectbox(
     "Select KPI for Gap Analysis",
@@ -159,12 +178,19 @@ selected_kpi_id = selected_row["KPI ID"]
 st.info(f"Selected KPI ID: {selected_kpi_id}")
 
 # =========================
-# SHOW UPLOAD OPTIONS ONLY AFTER KPI SELECTED
+# SUPPORTING FILE UPLOADS
 # =========================
 st.subheader("Upload Supporting Files")
 
-schema_file = st.file_uploader("Upload Schema Excel", type=["xlsx"])
-data_file = st.file_uploader("Upload Sample Data Excel (optional)", type=["xlsx"])
+schema_file = st.file_uploader(
+    "Upload Schema Excel",
+    type=["xlsx"]
+)
+
+data_file = st.file_uploader(
+    "Upload Sample Data Excel (optional)",
+    type=["xlsx"]
+)
 
 # =========================
 # RUN ANALYSIS
@@ -180,7 +206,7 @@ if schema_file and st.button("Run Gap Analysis"):
     with st.spinner("Retrieving regulatory context..."):
         reg_text = retrieve_regulatory_context(selected_kpi)
 
-    with st.spinner("Running AI Analysis..."):
+    with st.spinner("Running AI Gap Analysis..."):
         raw_output = run_gap_analysis(
             selected_kpi_id,
             selected_kpi,
@@ -190,12 +216,14 @@ if schema_file and st.button("Run Gap Analysis"):
 
     try:
         result = json.loads(raw_output)
-    except:
-        st.error("Model did not return valid JSON")
-        st.write(raw_output)
+    except json.JSONDecodeError:
+        st.error("Model did not return valid JSON.")
+        st.code(raw_output)
         st.stop()
 
-    # Fill columns
+    # =========================
+    # UPDATE KPI TABLE
+    # =========================
     kpi_df.loc[
         kpi_df["KPI Name"] == selected_kpi,
         "Feasiblity"
@@ -219,10 +247,18 @@ if schema_file and st.button("Run Gap Analysis"):
     st.success("Gap Analysis Completed")
 
     st.subheader("Updated KPI Table")
-    st.dataframe(kpi_df)
+    st.dataframe(kpi_df, use_container_width=True)
 
-    # Save updated Excel back
-    updated_path = r"C:\Users\WH327AH\OneDrive - EY\Desktop\MSM AI\Excel_Updated.xlsx"
-    kpi_df.to_excel(updated_path, index=False)
+    # =========================
+    # DOWNLOAD UPDATED FILE
+    # =========================
+    output = BytesIO()
+    kpi_df.to_excel(output, index=False)
+    output.seek(0)
 
-    st.success(f"Updated file saved to: {updated_path}")
+    st.download_button(
+        label="Download Updated KPI Excel",
+        data=output,
+        file_name="Excel_Updated.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )

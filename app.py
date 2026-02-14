@@ -137,7 +137,7 @@ Return JSON:
 """
 
     response = llm_client.chat.completions.create(
-        model="gpt-5",
+        model="gpt-4.1",
         temperature=0.1,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},

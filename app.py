@@ -65,7 +65,7 @@ COLLECTION_CONFIG = {
 def retrieve_regulatory_context(query: str):
 
     texts = []
-    evidence = []
+    audit_trace = []
 
     for collection, dim in COLLECTION_CONFIG.items():
 
@@ -80,20 +80,18 @@ def retrieve_regulatory_context(query: str):
         for point in results.points:
             payload = point.payload or {}
 
+            # ✅ actual regulation text
             text = payload.get("text") or payload.get("document") or ""
-            source = payload.get("source", "unknown")
-            page = payload.get("page", "NA")
 
             if text:
                 texts.append(f"[{collection}] {text}")
-                evidence.append({
+
+                audit_trace.append({
                     "collection": collection,
-                    "source": source,
-                    "page": page,
-                    "snippet": text[:300]
+                    "text": text[:500]   # first 500 chars for audit
                 })
 
-    return "\n\n".join(texts), evidence
+    return "\n\n".join(texts), audit_trace
 
 # =========================
 # GAP ANALYSIS PROMPT (UNCHANGED)
@@ -163,14 +161,14 @@ if not excel_files:
     st.stop()
 
 # =========================
-# KPI FILE
+# KPI MASTER
 # =========================
 st.subheader("Select KPI Master File")
 
 kpi_file_name = st.selectbox("Select KPI Excel", excel_files)
 kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file_name))
 
-# Ensure new columns exist
+# Ensure audit columns exist
 for col in ["Audit Score", "Traceability"]:
     if col not in kpi_df.columns:
         kpi_df[col] = ""
@@ -203,7 +201,7 @@ schema_text = "\n".join(
     schema_df.astype(str).agg(" | ".join, axis=1)
 )
 
-# (Sample data is loaded only for audit visibility – no risky logic)
+# sample data is loaded only for completeness / audit
 if sample_file_name != "None":
     sample_df = pd.read_excel(os.path.join(BASE_DIR, sample_file_name))
 else:
@@ -215,7 +213,7 @@ else:
 if st.button("Run Gap Analysis"):
 
     with st.spinner("Retrieving regulatory context..."):
-        reg_text, audit_lines = retrieve_regulatory_context(selected_kpi)
+        reg_text, audit_trace = retrieve_regulatory_context(selected_kpi)
 
     with st.spinner("Running AI Gap Analysis..."):
         raw_output = run_gap_analysis(
@@ -236,12 +234,9 @@ if st.button("Run Gap Analysis"):
     audit_score = int((len(available) / len(required)) * 100) if required else 0
 
     # -------------------------
-    # TRACEABILITY
+    # TRACEABILITY (COLLECTION NAMES)
     # -------------------------
-    trace_refs = [
-        f"{e['source']} (page {e['page']})"
-        for e in audit_lines
-    ]
+    trace_refs = sorted(set([e["collection"] for e in audit_trace]))
 
     # =========================
     # UPDATE KPI TABLE
@@ -251,18 +246,18 @@ if st.button("Run Gap Analysis"):
     kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Column name which are required more"] = ", ".join(result["missing_fields"])
     kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Reason"] = result["reasoning"]
     kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Audit Score"] = audit_score
-    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Traceability"] = "; ".join(set(trace_refs))
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Traceability"] = "; ".join(trace_refs)
 
     st.success("Gap Analysis Completed")
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
 
-    with st.expander("Audit Evidence (Vector DB Snippets)"):
-        st.json(audit_lines)
+    with st.expander("Audit Evidence (Vector DB Text Used)"):
+        st.json(audit_trace)
 
     # =========================
-    # DOWNLOAD
+    # DOWNLOAD UPDATED FILE
     # =========================
     output = BytesIO()
     kpi_df.to_excel(output, index=False)

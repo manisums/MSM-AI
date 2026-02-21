@@ -60,7 +60,7 @@ COLLECTION_CONFIG = {
 }
 
 # =========================
-# RETRIEVE REGULATORY CONTEXT + AUDIT LINES
+# RETRIEVE REGULATORY CONTEXT + AUDIT TRACE
 # =========================
 def retrieve_regulatory_context(query: str):
 
@@ -86,7 +86,6 @@ def retrieve_regulatory_context(query: str):
 
             if text:
                 texts.append(f"[{collection}] {text}")
-
                 evidence.append({
                     "collection": collection,
                     "source": source,
@@ -171,7 +170,7 @@ st.subheader("Select KPI Master File")
 kpi_file_name = st.selectbox("Select KPI Excel", excel_files)
 kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file_name))
 
-# Ensure new columns exist (NO NULL ISSUES)
+# Ensure new columns exist
 for col in ["Audit Score", "Traceability"]:
     if col not in kpi_df.columns:
         kpi_df[col] = ""
@@ -188,18 +187,27 @@ selected_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 selected_kpi_id = selected_row["KPI ID"]
 
 # =========================
-# SCHEMA FILE
+# SCHEMA + SAMPLE DATA
 # =========================
-st.subheader("Select Schema File")
+st.subheader("Select Supporting Files")
 
 schema_file_name = st.selectbox("Select Schema Excel", excel_files)
+sample_file_name = st.selectbox(
+    "Select Sample Data Excel (optional)",
+    ["None"] + excel_files
+)
+
 schema_df = pd.read_excel(os.path.join(BASE_DIR, schema_file_name))
 
 schema_text = "\n".join(
     schema_df.astype(str).agg(" | ".join, axis=1)
 )
 
-schema_columns = [c.lower().strip() for c in schema_df.columns]
+# (Sample data is loaded only for audit visibility – no risky logic)
+if sample_file_name != "None":
+    sample_df = pd.read_excel(os.path.join(BASE_DIR, sample_file_name))
+else:
+    sample_df = None
 
 # =========================
 # RUN ANALYSIS
@@ -220,18 +228,15 @@ if st.button("Run Gap Analysis"):
     result = json.loads(raw_output)
 
     # -------------------------
-    # AUDIT SCORE (DETERMINISTIC)
+    # AUDIT SCORE
     # -------------------------
-    required = [f.lower() for f in result["required_fields"]]
-    available = [f.lower() for f in result["available_fields"]]
+    required = result["required_fields"]
+    available = result["available_fields"]
 
-    audit_score = (
-        int((len(available) / len(required)) * 100)
-        if required else 0
-    )
+    audit_score = int((len(available) / len(required)) * 100) if required else 0
 
     # -------------------------
-    # TRACEABILITY (DOC + PAGE)
+    # TRACEABILITY
     # -------------------------
     trace_refs = [
         f"{e['source']} (page {e['page']})"
@@ -241,46 +246,23 @@ if st.button("Run Gap Analysis"):
     # =========================
     # UPDATE KPI TABLE
     # =========================
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Feasiblity"
-    ] = result["feasibility"]
-
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Column names which are available"
-    ] = ", ".join(result["available_fields"])
-
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Column name which are required more"
-    ] = ", ".join(result["missing_fields"])
-
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Reason"
-    ] = result["reasoning"]
-
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Audit Score"
-    ] = audit_score
-
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Traceability"
-    ] = "; ".join(set(trace_refs))
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Feasiblity"] = result["feasibility"]
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Column names which are available"] = ", ".join(available)
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Column name which are required more"] = ", ".join(result["missing_fields"])
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Reason"] = result["reasoning"]
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Audit Score"] = audit_score
+    kpi_df.loc[kpi_df["KPI Name"] == selected_kpi, "Traceability"] = "; ".join(set(trace_refs))
 
     st.success("Gap Analysis Completed")
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
 
-    with st.expander("Audit Evidence (Vector DB Lines)"):
+    with st.expander("Audit Evidence (Vector DB Snippets)"):
         st.json(audit_lines)
 
     # =========================
-    # DOWNLOAD UPDATED FILE
+    # DOWNLOAD
     # =========================
     output = BytesIO()
     kpi_df.to_excel(output, index=False)

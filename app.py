@@ -12,18 +12,14 @@ from qdrant_client import QdrantClient
 # STREAMLIT CONFIG
 # =========================
 st.set_page_config(page_title="MSM ESG Gap Engine", layout="wide")
-st.title("MSM ESG KPI Gap Analysis Engine (Audit Safe)")
+st.title("MSM ESG KPI Gap Analysis Engine (Final – Audit Ready)")
 
 # =========================
 # SECRETS
 # =========================
-try:
-    QDRANT_URL = st.secrets["QDRANT_URL"]
-    QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-except KeyError:
-    st.error("Secrets not found.")
-    st.stop()
+QDRANT_URL = st.secrets["QDRANT_URL"]
+QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 # =========================
 # CLIENTS
@@ -34,6 +30,48 @@ qdrant_client = QdrantClient(
     api_key=QDRANT_API_KEY,
     check_compatibility=False
 )
+
+# =========================
+# FILE DISCOVERY (NO UPLOADS)
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def list_excel_files():
+    return sorted([f for f in os.listdir(BASE_DIR) if f.endswith(".xlsx")])
+
+excel_files = list_excel_files()
+if not excel_files:
+    st.error("No Excel files found in project directory.")
+    st.stop()
+
+# =========================
+# FILE SELECTION
+# =========================
+st.subheader("Select Input Files")
+
+kpi_file = st.selectbox("Select KPI Master", excel_files)
+bor_file = st.selectbox("Select BOR / Schema File", excel_files)
+
+kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file))
+bor_df = pd.read_excel(os.path.join(BASE_DIR, bor_file))
+
+bor_columns = [c.lower().strip() for c in bor_df.columns]
+
+# =========================
+# ENSURE OUTPUT COLUMNS EXIST (CRITICAL)
+# =========================
+OUTPUT_COLUMNS = [
+    "Feasiblity",
+    "Available Columns",
+    "Required More Columns",
+    "Audit Score",
+    "Traceability",
+    "Reason"
+]
+
+for col in OUTPUT_COLUMNS:
+    if col not in kpi_df.columns:
+        kpi_df[col] = ""
 
 # =========================
 # EMBEDDINGS
@@ -51,7 +89,7 @@ def embed_3072(text):
     ).data[0].embedding
 
 # =========================
-# COLLECTION CONFIG
+# VECTOR COLLECTIONS
 # =========================
 COLLECTION_CONFIG = {
     "esg_regulations": 1536,
@@ -60,60 +98,52 @@ COLLECTION_CONFIG = {
 }
 
 # =========================
-# RETRIEVE REGULATORY CONTEXT + TRACE
+# RETRIEVE REGULATORY CONTEXT + TRACEABILITY
 # =========================
-def retrieve_regulatory_context(query):
+def retrieve_regulatory_context(kpi_name):
 
-    texts = []
     evidence = []
+    text_blocks = []
 
     for collection, dim in COLLECTION_CONFIG.items():
-        vector = embed_3072(query) if dim == 3072 else embed_1536(query)
+        vector = embed_3072(kpi_name) if dim == 3072 else embed_1536(kpi_name)
 
         results = qdrant_client.query_points(
             collection_name=collection,
             query=vector,
-            limit=6
+            limit=5
         )
 
         for point in results.points:
             payload = point.payload or {}
-
             text = payload.get("text") or payload.get("document") or ""
             source = payload.get("source", "unknown")
             page = payload.get("page", "NA")
 
             if text:
-                texts.append(f"[{collection}] {text}")
-                evidence.append({
-                    "collection": collection,
-                    "source": source,
-                    "page": page,
-                    "snippet": text[:300]
-                })
+                text_blocks.append(text)
+                evidence.append(f"{source} (page {page})")
 
-    return "\n\n".join(texts), evidence
+    return "\n".join(text_blocks), list(set(evidence))
 
 # =========================
-# GAP ANALYSIS (LLM DOES ONLY REQUIRED FIELDS)
+# LLM – REQUIRED FIELDS ONLY
 # =========================
 SYSTEM_PROMPT = """
 You are an ESG regulatory expert.
-Identify REQUIRED data fields only.
+Identify ONLY the REQUIRED data fields needed to calculate the KPI.
+Do not check availability.
 Return valid JSON only.
 """
 
-def run_gap_analysis(kpi_id, kpi_name, reg_text):
+def get_required_fields(kpi_id, kpi_name, reg_text):
 
-    USER_PROMPT = f"""
+    prompt = f"""
 KPI ID: {kpi_id}
 KPI NAME: {kpi_name}
 
 REGULATORY CONTEXT:
 {reg_text}
-
-TASK:
-List only the REQUIRED fields to calculate this KPI.
 
 Return JSON:
 {{
@@ -127,54 +157,40 @@ Return JSON:
         temperature=0,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT}
+            {"role": "user", "content": prompt}
         ]
     )
 
-    return response.choices[0].message.content
+    return json.loads(response.choices[0].message.content)
 
 # =========================
-# KPI FILE UPLOAD
+# AUDIT SCORE
 # =========================
-st.subheader("Upload KPI Master File")
-
-kpi_file = st.file_uploader("Upload KPI Excel", type=["xlsx"])
-if not kpi_file:
-    st.stop()
-
-kpi_df = pd.read_excel(kpi_file)
+def calculate_audit_score(required, available):
+    if not required:
+        return 0
+    return int((len(available) / len(required)) * 100)
 
 # =========================
 # KPI SELECTION
 # =========================
-selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
+st.subheader("Select KPI")
+selected_kpi = st.selectbox("Choose KPI", kpi_df["KPI Name"])
+
 row_idx = kpi_df[kpi_df["KPI Name"] == selected_kpi].index[0]
 kpi_id = kpi_df.at[row_idx, "KPI ID"]
-
-# =========================
-# SUPPORTING FILES
-# =========================
-schema_file = st.file_uploader("Upload Schema Excel", type=["xlsx"])
-
-if not schema_file:
-    st.stop()
-
-schema_df = pd.read_excel(schema_file)
-schema_columns = [c.lower().strip() for c in schema_df.columns]
 
 # =========================
 # RUN ANALYSIS
 # =========================
 if st.button("Run Gap Analysis"):
 
-    reg_text, evidence = retrieve_regulatory_context(selected_kpi)
-    raw = run_gap_analysis(kpi_id, selected_kpi, reg_text)
+    reg_text, trace = retrieve_regulatory_context(selected_kpi)
+    result = get_required_fields(kpi_id, selected_kpi, reg_text)
 
-    result = json.loads(raw)
     required = [f.lower().strip() for f in result["required_fields"]]
-
-    available = [f for f in required if f in schema_columns]
-    missing = [f for f in required if f not in schema_columns]
+    available = [f for f in required if f in bor_columns]
+    missing = [f for f in required if f not in bor_columns]
 
     feasibility = (
         "FULLY_CALCULABLE" if not missing else
@@ -182,14 +198,20 @@ if st.button("Run Gap Analysis"):
         "NOT_CALCULABLE"
     )
 
-    # SAFE ASSIGNMENTS (NO NULLS)
+    audit_score = calculate_audit_score(required, available)
+
+    # =========================
+    # WRITE RESULTS (NO NULLS)
+    # =========================
     kpi_df.at[row_idx, "Feasiblity"] = feasibility
-    kpi_df.at[row_idx, "Column names which are available"] = ", ".join(available)
-    kpi_df.at[row_idx, "Column name which are required more"] = ", ".join(missing)
+    kpi_df.at[row_idx, "Available Columns"] = ", ".join(available)
+    kpi_df.at[row_idx, "Required More Columns"] = ", ".join(missing)
+    kpi_df.at[row_idx, "Audit Score"] = audit_score
+    kpi_df.at[row_idx, "Traceability"] = "; ".join(trace)
     kpi_df.at[row_idx, "Reason"] = result["reasoning"]
 
     # =========================
-    # AUDIT LOG
+    # SAVE AUDIT LOG
     # =========================
     os.makedirs("audit_logs", exist_ok=True)
 
@@ -201,18 +223,21 @@ if st.button("Run Gap Analysis"):
         "available_fields": available,
         "missing_fields": missing,
         "feasibility": feasibility,
-        "audit_trace": evidence
+        "audit_score": audit_score,
+        "traceability": trace
     }
 
     with open(f"audit_logs/{kpi_id}.json", "w") as f:
         json.dump(audit_record, f, indent=2)
 
     st.success("Gap Analysis Completed")
-    st.dataframe(kpi_df, use_container_width=True)
 
-    with st.expander("Audit Trace"):
-        st.json(evidence)
+    st.subheader("Result")
+    st.dataframe(kpi_df.loc[[row_idx]], use_container_width=True)
 
+    # =========================
+    # DOWNLOAD
+    # =========================
     output = BytesIO()
     kpi_df.to_excel(output, index=False)
     output.seek(0)
@@ -220,5 +245,5 @@ if st.button("Run Gap Analysis"):
     st.download_button(
         "Download Updated KPI Excel",
         output,
-        "Excel_Updated.xlsx"
+        "KPI_Master_Updated.xlsx"
     )

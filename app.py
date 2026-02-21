@@ -1,7 +1,10 @@
+import os
+import json
+import datetime
+from io import BytesIO
+
 import streamlit as st
 import pandas as pd
-import json
-from io import BytesIO
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -14,17 +17,17 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("MSM ESG KPI Gap Analysis Engine")
+st.title("MSM ESG KPI Gap Analysis Engine (Audit Ready)")
 
 # =========================
-# SECRETS (STREAMLIT CLOUD)
+# SECRETS
 # =========================
 try:
     QDRANT_URL = st.secrets["QDRANT_URL"]
     QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 except KeyError:
-    st.error("Secrets not found. Please configure secrets in Streamlit Cloud.")
+    st.error("Secrets not found. Configure Streamlit secrets.")
     st.stop()
 
 # =========================
@@ -39,16 +42,34 @@ qdrant_client = QdrantClient(
 )
 
 # =========================
-# EMBEDDING FUNCTIONS
+# FILE DISCOVERY
 # =========================
-def embed_1536(text: str):
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIT_DIR = os.path.join(BASE_DIR, "audit_logs")
+os.makedirs(AUDIT_DIR, exist_ok=True)
+
+def list_excel_files(directory):
+    return sorted([
+        f for f in os.listdir(directory)
+        if f.lower().endswith(".xlsx")
+    ])
+
+excel_files = list_excel_files(BASE_DIR)
+
+if not excel_files:
+    st.error("No Excel files found in project directory.")
+    st.stop()
+
+# =========================
+# EMBEDDINGS
+# =========================
+def embed_1536(text):
     return llm_client.embeddings.create(
         model="text-embedding-3-small",
         input=text
     ).data[0].embedding
 
-
-def embed_3072(text: str):
+def embed_3072(text):
     return llm_client.embeddings.create(
         model="text-embedding-3-large",
         input=text
@@ -64,21 +85,20 @@ COLLECTION_CONFIG = {
 }
 
 # =========================
-# RETRIEVE REGULATORY CONTEXT
+# RETRIEVE CONTEXT
 # =========================
-def retrieve_regulatory_context(query: str) -> str:
+def retrieve_regulatory_context(query):
 
     texts = []
+    used_collections = set()
 
     for collection, dim in COLLECTION_CONFIG.items():
 
-        query_vector = (
-            embed_3072(query) if dim == 3072 else embed_1536(query)
-        )
+        vector = embed_3072(query) if dim == 3072 else embed_1536(query)
 
         results = qdrant_client.query_points(
             collection_name=collection,
-            query=query_vector,
+            query=vector,
             limit=6
         )
 
@@ -89,12 +109,13 @@ def retrieve_regulatory_context(query: str) -> str:
                 or ""
             )
             if txt:
+                used_collections.add(collection)
                 texts.append(f"[{collection}] {txt}")
 
-    return "\n\n".join(texts)
+    return "\n\n".join(texts), list(used_collections)
 
 # =========================
-# GAP ANALYSIS PROMPTS
+# GAP ANALYSIS PROMPT
 # =========================
 SYSTEM_PROMPT = """
 You are an ESG regulatory and carbon accounting expert.
@@ -126,7 +147,6 @@ TASK:
 5. Give reasoning.
 
 Return JSON:
-
 {{
   "feasibility": "",
   "required_fields": [],
@@ -148,110 +168,124 @@ Return JSON:
     return response.choices[0].message.content
 
 # =========================
-# KPI FILE UPLOAD
+# AUDIT SCORE
 # =========================
-st.subheader("Upload KPI Master File")
+def calculate_audit_score(result):
 
-kpi_file = st.file_uploader(
-    "Upload KPI Excel",
-    type=["xlsx"]
+    total = len(result["required_fields"])
+    available = len(result["available_fields"])
+
+    if total == 0:
+        return 0
+
+    coverage = available / total
+
+    if result["feasibility"] == "FULLY_CALCULABLE":
+        base = 80
+    elif result["feasibility"] == "PARTIALLY_CALCULABLE":
+        base = 50
+    else:
+        base = 20
+
+    return min(100, base + int(coverage * 20))
+
+# =========================
+# AUDIT SAVE
+# =========================
+def save_audit_trail(record):
+    path = os.path.join(AUDIT_DIR, f"{record['kpi_id']}.json")
+    with open(path, "w") as f:
+        json.dump(record, f, indent=2)
+
+# =========================
+# FILE SELECTION UI
+# =========================
+st.subheader("Select Input Files")
+
+kpi_file = st.selectbox("Select KPI Master Excel", excel_files)
+schema_file = st.selectbox("Select Schema Excel", excel_files)
+
+kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file))
+schema_df = pd.read_excel(os.path.join(BASE_DIR, schema_file))
+
+schema_text = "\n".join(
+    schema_df.astype(str).agg(" | ".join, axis=1)
 )
 
-if not kpi_file:
-    st.warning("Please upload KPI Excel file to proceed.")
-    st.stop()
-
-kpi_df = pd.read_excel(kpi_file)
-st.success("KPI file loaded successfully")
-
 # =========================
-# KPI SELECTION
+# KPI MULTI SELECTION
 # =========================
-selected_kpi = st.selectbox(
-    "Select KPI for Gap Analysis",
+st.subheader("Select KPIs for Gap Analysis")
+
+selected_kpis = st.multiselect(
+    "Choose one or more KPIs",
     kpi_df["KPI Name"]
 )
 
-selected_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
-selected_kpi_id = selected_row["KPI ID"]
-
-st.info(f"Selected KPI ID: {selected_kpi_id}")
-
-# =========================
-# SUPPORTING FILE UPLOADS
-# =========================
-st.subheader("Upload Supporting Files")
-
-schema_file = st.file_uploader(
-    "Upload Schema Excel",
-    type=["xlsx"]
-)
-
-data_file = st.file_uploader(
-    "Upload Sample Data Excel (optional)",
-    type=["xlsx"]
-)
+if not selected_kpis:
+    st.warning("Select at least one KPI.")
+    st.stop()
 
 # =========================
-# RUN ANALYSIS
+# RUN BATCH
 # =========================
-if schema_file and st.button("Run Gap Analysis"):
+if st.button("Run Batch Gap Analysis"):
 
-    schema_df = pd.read_excel(schema_file)
+    progress = st.progress(0)
+    total = len(selected_kpis)
 
-    schema_text = "\n".join(
-        schema_df.astype(str).agg(" | ".join, axis=1)
-    )
+    for idx, kpi_name in enumerate(selected_kpis, start=1):
 
-    with st.spinner("Retrieving regulatory context..."):
-        reg_text = retrieve_regulatory_context(selected_kpi)
+        row = kpi_df[kpi_df["KPI Name"] == kpi_name].iloc[0]
+        kpi_id = row["KPI ID"]
 
-    with st.spinner("Running AI Gap Analysis..."):
-        raw_output = run_gap_analysis(
-            selected_kpi_id,
-            selected_kpi,
+        reg_text, used_collections = retrieve_regulatory_context(kpi_name)
+
+        raw = run_gap_analysis(
+            kpi_id,
+            kpi_name,
             reg_text,
             schema_text
         )
 
-    try:
-        result = json.loads(raw_output)
-    except json.JSONDecodeError:
-        st.error("Model did not return valid JSON.")
-        st.code(raw_output)
-        st.stop()
+        result = json.loads(raw)
+        score = calculate_audit_score(result)
 
-    # =========================
-    # UPDATE KPI TABLE
-    # =========================
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Feasiblity"
-    ] = result["feasibility"]
+        # Update KPI Master
+        kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Feasiblity"] = result["feasibility"]
+        kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Audit Score"] = score
+        kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Reason"] = result["reasoning"]
 
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Column names which are available"
-    ] = ", ".join(result["available_fields"])
+        # Audit Trail
+        audit_record = {
+            "kpi_id": kpi_id,
+            "kpi_name": kpi_name,
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "feasibility": result["feasibility"],
+            "audit_score": score,
+            "required_fields": result["required_fields"],
+            "available_fields": result["available_fields"],
+            "missing_fields": result["missing_fields"],
+            "regulatory_collections": used_collections,
+            "evidence_snippets": reg_text.split("\n\n")[:5],
+            "reasoning": result["reasoning"],
+            "llm_model": "gpt-4.1",
+            "embedding_models": [
+                "text-embedding-3-small",
+                "text-embedding-3-large"
+            ]
+        }
 
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Column name which are required more"
-    ] = ", ".join(result["missing_fields"])
+        save_audit_trail(audit_record)
 
-    kpi_df.loc[
-        kpi_df["KPI Name"] == selected_kpi,
-        "Reason"
-    ] = result["reasoning"]
+        progress.progress(idx / total)
 
-    st.success("Gap Analysis Completed")
+    st.success("Batch Gap Analysis Completed")
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
 
-    # =========================
-    # DOWNLOAD UPDATED FILE
-    # =========================
+    # Download updated KPI master
     output = BytesIO()
     kpi_df.to_excel(output, index=False)
     output.seek(0)
@@ -259,6 +293,6 @@ if schema_file and st.button("Run Gap Analysis"):
     st.download_button(
         label="Download Updated KPI Excel",
         data=output,
-        file_name="Excel_Updated.xlsx",
+        file_name="KPI_Master_Updated.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )

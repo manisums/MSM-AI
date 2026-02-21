@@ -17,7 +17,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("MSM ESG KPI Gap Analysis Engine (Audit + Data Aware)")
+st.title("MSM ESG KPI Gap Analysis Engine (Audit + Evidence Ready)")
 
 # =========================
 # SECRETS
@@ -55,7 +55,6 @@ def list_excel_files(directory):
     ])
 
 excel_files = list_excel_files(BASE_DIR)
-
 if not excel_files:
     st.error("No Excel files found in project directory.")
     st.stop()
@@ -85,12 +84,12 @@ COLLECTION_CONFIG = {
 }
 
 # =========================
-# RETRIEVE REGULATORY CONTEXT
+# RETRIEVE REGULATORY CONTEXT + AUDIT TRACE
 # =========================
 def retrieve_regulatory_context(query):
 
     texts = []
-    used_collections = set()
+    evidence = []
 
     for collection, dim in COLLECTION_CONFIG.items():
 
@@ -103,16 +102,23 @@ def retrieve_regulatory_context(query):
         )
 
         for point in results.points:
-            txt = (
-                point.payload.get("text")
-                or point.payload.get("document")
-                or ""
-            )
-            if txt:
-                used_collections.add(collection)
-                texts.append(f"[{collection}] {txt}")
+            payload = point.payload or {}
 
-    return "\n\n".join(texts), list(used_collections)
+            text = payload.get("text") or payload.get("document") or ""
+            source = payload.get("source", "unknown")
+            page = payload.get("page", "NA")
+
+            if text:
+                texts.append(f"[{collection}] {text}")
+
+                evidence.append({
+                    "collection": collection,
+                    "source": source,
+                    "page": page,
+                    "snippet": text[:300]
+                })
+
+    return "\n\n".join(texts), evidence
 
 # =========================
 # GAP ANALYSIS PROMPT
@@ -138,16 +144,16 @@ REGULATORY CONTEXT:
 CLIENT SCHEMA:
 {schema_text}
 
-SAMPLE DATA (ACTUAL VALUES):
+SAMPLE DATA:
 {sample_text}
 
 TASK:
 1. Identify required fields from regulation.
-2. Check schema availability.
-3. Check if sample data is populated meaningfully.
+2. Match against schema.
+3. Consider whether sample data is populated.
 4. Decide feasibility:
    FULLY_CALCULABLE / PARTIALLY_CALCULABLE / NOT_CALCULABLE
-5. List missing or unusable fields.
+5. List required, available and missing fields.
 6. Provide audit-ready reasoning.
 
 Return JSON:
@@ -170,6 +176,25 @@ Return JSON:
     )
 
     return response.choices[0].message.content
+
+# =========================
+# NORMALIZE FIELDS (CRITICAL FIX)
+# =========================
+def normalize_fields(result, schema_columns):
+
+    available = []
+    missing = []
+
+    for field in result.get("required_fields", []):
+        if field.lower().strip() in schema_columns:
+            available.append(field)
+        else:
+            missing.append(field)
+
+    result["available_fields"] = available
+    result["missing_fields"] = missing
+
+    return result
 
 # =========================
 # AUDIT SCORE
@@ -202,32 +227,38 @@ def save_audit_trail(record):
         json.dump(record, f, indent=2)
 
 # =========================
-# FILE SELECTION UI
+# FILE SELECTION
 # =========================
 st.subheader("Select Input Files")
 
-kpi_file = st.selectbox("Select KPI Master Excel", excel_files)
-schema_file = st.selectbox("Select Schema Excel", excel_files)
-sample_file = st.selectbox("Select Sample Data Excel", excel_files)
+kpi_file = st.selectbox("KPI Master Excel", excel_files)
+schema_file = st.selectbox("Schema Excel", excel_files)
+sample_file = st.selectbox("Sample Data Excel", excel_files)
 
 kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file))
 schema_df = pd.read_excel(os.path.join(BASE_DIR, schema_file))
 sample_df = pd.read_excel(os.path.join(BASE_DIR, sample_file))
 
+schema_columns = [c.lower().strip() for c in schema_df.columns]
+
 schema_text = "\n".join(
     schema_df.astype(str).agg(" | ".join, axis=1)
 )
 
-# limit sample data for token safety
-sample_text = sample_df.head(50).astype(str).agg(" | ".join, axis=1).str.cat(sep="\n")
+sample_text = (
+    sample_df.head(50)
+    .astype(str)
+    .agg(" | ".join, axis=1)
+    .str.cat(sep="\n")
+)
 
 # =========================
 # KPI SELECTION
 # =========================
-st.subheader("Select KPIs for Gap Analysis")
+st.subheader("Select KPIs")
 
 selected_kpis = st.multiselect(
-    "Choose one or more KPIs",
+    "Choose KPIs for analysis",
     kpi_df["KPI Name"]
 )
 
@@ -248,7 +279,7 @@ if st.button("Run Batch Gap Analysis"):
         row = kpi_df[kpi_df["KPI Name"] == kpi_name].iloc[0]
         kpi_id = row["KPI ID"]
 
-        reg_text, used_collections = retrieve_regulatory_context(kpi_name)
+        reg_text, evidence = retrieve_regulatory_context(kpi_name)
 
         raw = run_gap_analysis(
             kpi_id,
@@ -259,12 +290,15 @@ if st.button("Run Batch Gap Analysis"):
         )
 
         result = json.loads(raw)
+        result = normalize_fields(result, schema_columns)
         score = calculate_audit_score(result)
 
-        # Update KPI Master
+        # Update KPI master
         kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Feasiblity"] = result["feasibility"]
         kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Audit Score"] = score
         kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Reason"] = result["reasoning"]
+        kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Column names which are available"] = ", ".join(result["available_fields"])
+        kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Column name which are required more"] = ", ".join(result["missing_fields"])
 
         # Audit trail
         audit_record = {
@@ -276,10 +310,9 @@ if st.button("Run Batch Gap Analysis"):
             "required_fields": result["required_fields"],
             "available_fields": result["available_fields"],
             "missing_fields": result["missing_fields"],
-            "regulatory_collections": used_collections,
-            "sample_data_used": sample_file,
-            "schema_used": schema_file,
-            "evidence_snippets": reg_text.split("\n\n")[:5],
+            "schema_file": schema_file,
+            "sample_file": sample_file,
+            "audit_trace": evidence,
             "reasoning": result["reasoning"],
             "llm_model": "gpt-4.1",
             "embedding_models": [
@@ -289,6 +322,9 @@ if st.button("Run Batch Gap Analysis"):
         }
 
         save_audit_trail(audit_record)
+
+        with st.expander(f"Audit Trace – {kpi_name}"):
+            st.json(audit_record["audit_trace"])
 
         progress.progress(idx / total)
 

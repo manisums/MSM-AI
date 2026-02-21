@@ -48,7 +48,6 @@ def embed_1536(text: str):
         input=text
     ).data[0].embedding
 
-
 def embed_3072(text: str):
     return llm_client.embeddings.create(
         model="text-embedding-3-large",
@@ -73,9 +72,7 @@ def retrieve_regulatory_context(query: str) -> str:
 
     for collection, dim in COLLECTION_CONFIG.items():
 
-        query_vector = (
-            embed_3072(query) if dim == 3072 else embed_1536(query)
-        )
+        query_vector = embed_3072(query) if dim == 3072 else embed_1536(query)
 
         results = qdrant_client.query_points(
             collection_name=collection,
@@ -127,7 +124,6 @@ TASK:
 5. Give reasoning.
 
 Return JSON:
-
 {{
   "feasibility": "",
   "required_fields": [],
@@ -149,10 +145,8 @@ Return JSON:
     return response.choices[0].message.content
 
 # =========================
-# KPI FILE SELECTION (DROPDOWN FROM REPO)
+# FILE DISCOVERY (GIT / REPO)
 # =========================
-st.subheader("Select KPI Master File")
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 excel_files = sorted([
@@ -164,14 +158,18 @@ if not excel_files:
     st.error("No Excel files found in repository.")
     st.stop()
 
+# =========================
+# KPI FILE (DROPDOWN)
+# =========================
+st.subheader("Select KPI Master File")
+
 kpi_file_name = st.selectbox(
     "Select KPI Excel",
-    excel_files
+    excel_files,
+    key="kpi"
 )
 
-kpi_path = os.path.join(BASE_DIR, kpi_file_name)
-kpi_df = pd.read_excel(kpi_path)
-
+kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file_name))
 st.success(f"KPI file loaded: {kpi_file_name}")
 
 # =========================
@@ -188,30 +186,32 @@ selected_kpi_id = selected_row["KPI ID"]
 st.info(f"Selected KPI ID: {selected_kpi_id}")
 
 # =========================
-# SUPPORTING FILE UPLOADS (UNCHANGED)
+# SCHEMA + SAMPLE DATA (DROPDOWN)
 # =========================
-st.subheader("Upload Supporting Files")
+st.subheader("Select Supporting Files")
 
-schema_file = st.file_uploader(
-    "Upload Schema Excel",
-    type=["xlsx"]
+schema_file_name = st.selectbox(
+    "Select Schema Excel",
+    excel_files,
+    key="schema"
 )
 
-data_file = st.file_uploader(
-    "Upload Sample Data Excel (optional)",
-    type=["xlsx"]
+sample_file_name = st.selectbox(
+    "Select Sample Data Excel (optional)",
+    ["None"] + excel_files,
+    key="sample"
+)
+
+schema_df = pd.read_excel(os.path.join(BASE_DIR, schema_file_name))
+
+schema_text = "\n".join(
+    schema_df.astype(str).agg(" | ".join, axis=1)
 )
 
 # =========================
 # RUN ANALYSIS
 # =========================
-if schema_file and st.button("Run Gap Analysis"):
-
-    schema_df = pd.read_excel(schema_file)
-
-    schema_text = "\n".join(
-        schema_df.astype(str).agg(" | ".join, axis=1)
-    )
+if st.button("Run Gap Analysis"):
 
     with st.spinner("Retrieving regulatory context..."):
         reg_text = retrieve_regulatory_context(selected_kpi)

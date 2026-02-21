@@ -18,15 +18,11 @@ st.set_page_config(
 st.title("MSM ESG KPI Gap Analysis Engine")
 
 # =========================
-# SECRETS (STREAMLIT CLOUD)
+# SECRETS
 # =========================
-try:
-    QDRANT_URL = st.secrets["QDRANT_URL"]
-    QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-except KeyError:
-    st.error("Secrets not found. Please configure secrets in Streamlit Cloud.")
-    st.stop()
+QDRANT_URL = st.secrets["QDRANT_URL"]
+QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
+OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 
 # =========================
 # CLIENTS
@@ -40,7 +36,7 @@ qdrant_client = QdrantClient(
 )
 
 # =========================
-# EMBEDDING FUNCTIONS
+# EMBEDDINGS
 # =========================
 def embed_1536(text: str):
     return llm_client.embeddings.create(
@@ -64,11 +60,12 @@ COLLECTION_CONFIG = {
 }
 
 # =========================
-# RETRIEVE REGULATORY CONTEXT
+# RETRIEVE REGULATORY CONTEXT + AUDIT LINES
 # =========================
-def retrieve_regulatory_context(query: str) -> str:
+def retrieve_regulatory_context(query: str):
 
     texts = []
+    evidence = []
 
     for collection, dim in COLLECTION_CONFIG.items():
 
@@ -81,18 +78,26 @@ def retrieve_regulatory_context(query: str) -> str:
         )
 
         for point in results.points:
-            txt = (
-                point.payload.get("text")
-                or point.payload.get("document")
-                or ""
-            )
-            if txt:
-                texts.append(f"[{collection}] {txt}")
+            payload = point.payload or {}
 
-    return "\n\n".join(texts)
+            text = payload.get("text") or payload.get("document") or ""
+            source = payload.get("source", "unknown")
+            page = payload.get("page", "NA")
+
+            if text:
+                texts.append(f"[{collection}] {text}")
+
+                evidence.append({
+                    "collection": collection,
+                    "source": source,
+                    "page": page,
+                    "snippet": text[:300]
+                })
+
+    return "\n\n".join(texts), evidence
 
 # =========================
-# GAP ANALYSIS PROMPTS
+# GAP ANALYSIS PROMPT (UNCHANGED)
 # =========================
 SYSTEM_PROMPT = """
 You are an ESG regulatory and carbon accounting expert.
@@ -145,7 +150,7 @@ Return JSON:
     return response.choices[0].message.content
 
 # =========================
-# FILE DISCOVERY (GIT / REPO)
+# FILE DISCOVERY (DROPDOWNS)
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -159,18 +164,17 @@ if not excel_files:
     st.stop()
 
 # =========================
-# KPI FILE (DROPDOWN)
+# KPI FILE
 # =========================
 st.subheader("Select KPI Master File")
 
-kpi_file_name = st.selectbox(
-    "Select KPI Excel",
-    excel_files,
-    key="kpi"
-)
-
+kpi_file_name = st.selectbox("Select KPI Excel", excel_files)
 kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file_name))
-st.success(f"KPI file loaded: {kpi_file_name}")
+
+# Ensure new columns exist (NO NULL ISSUES)
+for col in ["Audit Score", "Traceability"]:
+    if col not in kpi_df.columns:
+        kpi_df[col] = ""
 
 # =========================
 # KPI SELECTION
@@ -183,30 +187,19 @@ selected_kpi = st.selectbox(
 selected_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 selected_kpi_id = selected_row["KPI ID"]
 
-st.info(f"Selected KPI ID: {selected_kpi_id}")
-
 # =========================
-# SCHEMA + SAMPLE DATA (DROPDOWN)
+# SCHEMA FILE
 # =========================
-st.subheader("Select Supporting Files")
+st.subheader("Select Schema File")
 
-schema_file_name = st.selectbox(
-    "Select Schema Excel",
-    excel_files,
-    key="schema"
-)
-
-sample_file_name = st.selectbox(
-    "Select Sample Data Excel (optional)",
-    ["None"] + excel_files,
-    key="sample"
-)
-
+schema_file_name = st.selectbox("Select Schema Excel", excel_files)
 schema_df = pd.read_excel(os.path.join(BASE_DIR, schema_file_name))
 
 schema_text = "\n".join(
     schema_df.astype(str).agg(" | ".join, axis=1)
 )
+
+schema_columns = [c.lower().strip() for c in schema_df.columns]
 
 # =========================
 # RUN ANALYSIS
@@ -214,7 +207,7 @@ schema_text = "\n".join(
 if st.button("Run Gap Analysis"):
 
     with st.spinner("Retrieving regulatory context..."):
-        reg_text = retrieve_regulatory_context(selected_kpi)
+        reg_text, audit_lines = retrieve_regulatory_context(selected_kpi)
 
     with st.spinner("Running AI Gap Analysis..."):
         raw_output = run_gap_analysis(
@@ -224,15 +217,29 @@ if st.button("Run Gap Analysis"):
             schema_text
         )
 
-    try:
-        result = json.loads(raw_output)
-    except json.JSONDecodeError:
-        st.error("Model did not return valid JSON.")
-        st.code(raw_output)
-        st.stop()
+    result = json.loads(raw_output)
+
+    # -------------------------
+    # AUDIT SCORE (DETERMINISTIC)
+    # -------------------------
+    required = [f.lower() for f in result["required_fields"]]
+    available = [f.lower() for f in result["available_fields"]]
+
+    audit_score = (
+        int((len(available) / len(required)) * 100)
+        if required else 0
+    )
+
+    # -------------------------
+    # TRACEABILITY (DOC + PAGE)
+    # -------------------------
+    trace_refs = [
+        f"{e['source']} (page {e['page']})"
+        for e in audit_lines
+    ]
 
     # =========================
-    # UPDATE KPI TABLE (UNCHANGED)
+    # UPDATE KPI TABLE
     # =========================
     kpi_df.loc[
         kpi_df["KPI Name"] == selected_kpi,
@@ -254,10 +261,23 @@ if st.button("Run Gap Analysis"):
         "Reason"
     ] = result["reasoning"]
 
+    kpi_df.loc[
+        kpi_df["KPI Name"] == selected_kpi,
+        "Audit Score"
+    ] = audit_score
+
+    kpi_df.loc[
+        kpi_df["KPI Name"] == selected_kpi,
+        "Traceability"
+    ] = "; ".join(set(trace_refs))
+
     st.success("Gap Analysis Completed")
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
+
+    with st.expander("Audit Evidence (Vector DB Lines)"):
+        st.json(audit_lines)
 
     # =========================
     # DOWNLOAD UPDATED FILE

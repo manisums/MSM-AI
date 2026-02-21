@@ -17,7 +17,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("MSM ESG KPI Gap Analysis Engine (Audit Ready)")
+st.title("MSM ESG KPI Gap Analysis Engine (Audit + Data Aware)")
 
 # =========================
 # SECRETS
@@ -42,7 +42,7 @@ qdrant_client = QdrantClient(
 )
 
 # =========================
-# FILE DISCOVERY
+# DIRECTORIES
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AUDIT_DIR = os.path.join(BASE_DIR, "audit_logs")
@@ -85,7 +85,7 @@ COLLECTION_CONFIG = {
 }
 
 # =========================
-# RETRIEVE CONTEXT
+# RETRIEVE REGULATORY CONTEXT
 # =========================
 def retrieve_regulatory_context(query):
 
@@ -119,11 +119,11 @@ def retrieve_regulatory_context(query):
 # =========================
 SYSTEM_PROMPT = """
 You are an ESG regulatory and carbon accounting expert.
-Use only regulatory context to determine feasibility.
+Use only regulatory context, schema and sample data.
 Return strictly valid JSON only.
 """
 
-def run_gap_analysis(kpi_id, kpi_name, reg_text, schema_text):
+def run_gap_analysis(kpi_id, kpi_name, reg_text, schema_text, sample_text):
 
     USER_PROMPT = f"""
 KPI ID:
@@ -138,13 +138,17 @@ REGULATORY CONTEXT:
 CLIENT SCHEMA:
 {schema_text}
 
+SAMPLE DATA (ACTUAL VALUES):
+{sample_text}
+
 TASK:
-1. Identify required fields.
-2. Match with schema.
-3. Decide:
+1. Identify required fields from regulation.
+2. Check schema availability.
+3. Check if sample data is populated meaningfully.
+4. Decide feasibility:
    FULLY_CALCULABLE / PARTIALLY_CALCULABLE / NOT_CALCULABLE
-4. List missing fields.
-5. Give reasoning.
+5. List missing or unusable fields.
+6. Provide audit-ready reasoning.
 
 Return JSON:
 {{
@@ -181,16 +185,16 @@ def calculate_audit_score(result):
     coverage = available / total
 
     if result["feasibility"] == "FULLY_CALCULABLE":
-        base = 80
+        base = 85
     elif result["feasibility"] == "PARTIALLY_CALCULABLE":
-        base = 50
+        base = 55
     else:
-        base = 20
+        base = 25
 
-    return min(100, base + int(coverage * 20))
+    return min(100, base + int(coverage * 15))
 
 # =========================
-# AUDIT SAVE
+# SAVE AUDIT TRAIL
 # =========================
 def save_audit_trail(record):
     path = os.path.join(AUDIT_DIR, f"{record['kpi_id']}.json")
@@ -204,16 +208,21 @@ st.subheader("Select Input Files")
 
 kpi_file = st.selectbox("Select KPI Master Excel", excel_files)
 schema_file = st.selectbox("Select Schema Excel", excel_files)
+sample_file = st.selectbox("Select Sample Data Excel", excel_files)
 
 kpi_df = pd.read_excel(os.path.join(BASE_DIR, kpi_file))
 schema_df = pd.read_excel(os.path.join(BASE_DIR, schema_file))
+sample_df = pd.read_excel(os.path.join(BASE_DIR, sample_file))
 
 schema_text = "\n".join(
     schema_df.astype(str).agg(" | ".join, axis=1)
 )
 
+# limit sample data for token safety
+sample_text = sample_df.head(50).astype(str).agg(" | ".join, axis=1).str.cat(sep="\n")
+
 # =========================
-# KPI MULTI SELECTION
+# KPI SELECTION
 # =========================
 st.subheader("Select KPIs for Gap Analysis")
 
@@ -227,7 +236,7 @@ if not selected_kpis:
     st.stop()
 
 # =========================
-# RUN BATCH
+# RUN BATCH ANALYSIS
 # =========================
 if st.button("Run Batch Gap Analysis"):
 
@@ -245,7 +254,8 @@ if st.button("Run Batch Gap Analysis"):
             kpi_id,
             kpi_name,
             reg_text,
-            schema_text
+            schema_text,
+            sample_text
         )
 
         result = json.loads(raw)
@@ -256,7 +266,7 @@ if st.button("Run Batch Gap Analysis"):
         kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Audit Score"] = score
         kpi_df.loc[kpi_df["KPI Name"] == kpi_name, "Reason"] = result["reasoning"]
 
-        # Audit Trail
+        # Audit trail
         audit_record = {
             "kpi_id": kpi_id,
             "kpi_name": kpi_name,
@@ -267,6 +277,8 @@ if st.button("Run Batch Gap Analysis"):
             "available_fields": result["available_fields"],
             "missing_fields": result["missing_fields"],
             "regulatory_collections": used_collections,
+            "sample_data_used": sample_file,
+            "schema_used": schema_file,
             "evidence_snippets": reg_text.split("\n\n")[:5],
             "reasoning": result["reasoning"],
             "llm_model": "gpt-4.1",

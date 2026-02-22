@@ -32,7 +32,7 @@ qdrant_client = QdrantClient(
 )
 
 # =====================================================
-# COLLECTIONS (ALL 1536-dim)
+# COLLECTIONS (ALL 1536-DIM)
 # =====================================================
 COLLECTIONS = [
     "client_bor",
@@ -42,7 +42,7 @@ COLLECTIONS = [
 ]
 
 # =====================================================
-# EMBEDDING (SINGLE MODEL)
+# EMBEDDING
 # =====================================================
 def embed(text: str):
     return openai_client.embeddings.create(
@@ -54,8 +54,8 @@ def embed(text: str):
 # RETRIEVE CONTEXT + AUDIT TRACE
 # =====================================================
 def retrieve_context_with_audit(query: str):
-    context_chunks = []
-    audit_rows = []
+    context = []
+    audit = []
 
     vector = embed(query)
 
@@ -71,16 +71,16 @@ def retrieve_context_with_audit(query: str):
             if not content:
                 continue
 
-            context_chunks.append(content)
+            context.append(content)
 
-            audit_rows.append({
+            audit.append({
                 "collection": collection,
                 "doc_type": p.payload.get("doc_type"),
                 "source": p.payload.get("source"),
                 "page": p.payload.get("page")
             })
 
-    return "\n\n".join(context_chunks), audit_rows
+    return "\n\n".join(context), audit
 
 # =====================================================
 # GAP ANALYSIS (LLM)
@@ -106,12 +106,6 @@ SCHEMA COLUMNS:
 DATA COLUMNS:
 {data_cols}
 
-TASK:
-1. Identify required fields from context
-2. Match with schema & data
-3. Decide feasibility
-4. List available and missing fields
-
 Return JSON:
 {{
   "feasibility": "FULLY_CALCULABLE | PARTIALLY_CALCULABLE | NOT_CALCULABLE",
@@ -122,7 +116,7 @@ Return JSON:
 }}
 """
 
-    response = openai_client.chat.completions.create(
+    res = openai_client.chat.completions.create(
         model="gpt-4.1",
         temperature=0,
         messages=[
@@ -131,12 +125,12 @@ Return JSON:
         ]
     )
 
-    return json.loads(response.choices[0].message.content)
+    return json.loads(res.choices[0].message.content)
 
 # =====================================================
-# AUDIT SCORE (DETERMINISTIC)
+# AUDIT SCORE
 # =====================================================
-def calculate_audit_score(result, audit_rows):
+def calculate_audit_score(result, audit):
     score = 0
 
     if result["feasibility"] == "FULLY_CALCULABLE":
@@ -145,17 +139,14 @@ def calculate_audit_score(result, audit_rows):
         score += 20
 
     score += min(len(result["available_fields"]) * 5, 30)
-    score += min(len(audit_rows) * 5, 30)
+    score += min(len(audit) * 5, 30)
 
     return min(score, 100)
 
 # =====================================================
-# FILE PICKERS (DROPDOWN FROM REPO)
+# FILE PICKERS (FROM REPO ROOT)
 # =====================================================
-BASE_PATH = "data"
-
-if not os.path.exists(BASE_PATH):
-    os.makedirs(BASE_PATH)
+BASE_PATH = "."
 
 excel_files = [
     f for f in os.listdir(BASE_PATH)
@@ -163,7 +154,7 @@ excel_files = [
 ]
 
 if not excel_files:
-    st.error("No Excel files found in /data folder. Please add files to the repo.")
+    st.error("No Excel files found in repository root.")
     st.stop()
 
 st.sidebar.header("Input Files")
@@ -175,18 +166,16 @@ data_file = st.sidebar.selectbox("Sample Data (optional)", ["None"] + excel_file
 # =====================================================
 # LOAD FILES
 # =====================================================
-kpi_df = pd.read_excel(os.path.join(BASE_PATH, kpi_file))
-schema_df = pd.read_excel(os.path.join(BASE_PATH, schema_file))
+kpi_df = pd.read_excel(kpi_file)
+schema_df = pd.read_excel(schema_file)
 
-data_df = None
-if data_file != "None":
-    data_df = pd.read_excel(os.path.join(BASE_PATH, data_file))
+data_df = pd.read_excel(data_file) if data_file != "None" else None
 
 # =====================================================
 # KPI SELECTION
 # =====================================================
 selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
-kpi_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
+row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 
 # =====================================================
 # RUN ANALYSIS
@@ -194,38 +183,32 @@ kpi_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 if st.button("Run Gap Analysis"):
 
     with st.spinner("Retrieving regulatory context..."):
-        context, audit_rows = retrieve_context_with_audit(selected_kpi)
+        context, audit = retrieve_context_with_audit(selected_kpi)
 
     schema_cols = schema_df.iloc[:, 0].astype(str).tolist()
     data_cols = data_df.columns.tolist() if data_df is not None else []
 
-    with st.spinner("Running AI gap analysis..."):
+    with st.spinner("Running gap analysis..."):
         result = run_gap_analysis(
-            kpi_row["KPI ID"],
+            row["KPI ID"],
             selected_kpi,
             context,
             schema_cols,
             data_cols
         )
 
-    audit_score = calculate_audit_score(result, audit_rows)
+    audit_score = calculate_audit_score(result, audit)
 
-    # =================================================
-    # UPDATE KPI TABLE
-    # =================================================
-    kpi_df.loc[kpi_row.name, "Feasibility"] = result["feasibility"]
-    kpi_df.loc[kpi_row.name, "Available Columns"] = ", ".join(result["available_fields"])
-    kpi_df.loc[kpi_row.name, "Missing Columns"] = ", ".join(result["missing_fields"])
-    kpi_df.loc[kpi_row.name, "Audit Score"] = audit_score
-    kpi_df.loc[kpi_row.name, "Reason"] = result["reasoning"]
+    kpi_df.loc[row.name, "Feasibility"] = result["feasibility"]
+    kpi_df.loc[row.name, "Available Columns"] = ", ".join(result["available_fields"])
+    kpi_df.loc[row.name, "Missing Columns"] = ", ".join(result["missing_fields"])
+    kpi_df.loc[row.name, "Audit Score"] = audit_score
+    kpi_df.loc[row.name, "Reason"] = result["reasoning"]
 
     st.success("Gap analysis completed")
 
-    # =================================================
-    # OUTPUTS
-    # =================================================
-    st.subheader("Audit Trace (from Qdrant)")
-    st.dataframe(pd.DataFrame(audit_rows), use_container_width=True)
+    st.subheader("Audit Trace (Vector DB Evidence)")
+    st.dataframe(pd.DataFrame(audit), use_container_width=True)
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)

@@ -10,7 +10,7 @@ from qdrant_client import QdrantClient
 # =====================================================
 # STREAMLIT CONFIG
 # =====================================================
-st.set_page_config(page_title="MSM ESG Gap Engine", layout="wide")
+st.set_page_config(page_title="MSM ESG KPI Gap Analysis Engine", layout="wide")
 st.title("MSM ESG KPI Gap Analysis Engine")
 
 # =====================================================
@@ -32,7 +32,7 @@ qdrant_client = QdrantClient(
 )
 
 # =====================================================
-# COLLECTIONS (ALL 1536)
+# COLLECTIONS (ALL 1536-dim)
 # =====================================================
 COLLECTIONS = [
     "client_bor",
@@ -42,7 +42,7 @@ COLLECTIONS = [
 ]
 
 # =====================================================
-# EMBEDDING
+# EMBEDDING (SINGLE MODEL)
 # =====================================================
 def embed(text: str):
     return openai_client.embeddings.create(
@@ -53,9 +53,9 @@ def embed(text: str):
 # =====================================================
 # RETRIEVE CONTEXT + AUDIT TRACE
 # =====================================================
-def retrieve_context_with_audit(query):
-    context = []
-    audit = []
+def retrieve_context_with_audit(query: str):
+    context_chunks = []
+    audit_rows = []
 
     vector = embed(query)
 
@@ -67,28 +67,28 @@ def retrieve_context_with_audit(query):
         )
 
         for p in results.points:
-            text = p.payload.get("content")
-            if not text:
+            content = p.payload.get("content")
+            if not content:
                 continue
 
-            context.append(text)
+            context_chunks.append(content)
 
-            audit.append({
+            audit_rows.append({
                 "collection": collection,
                 "doc_type": p.payload.get("doc_type"),
                 "source": p.payload.get("source"),
                 "page": p.payload.get("page")
             })
 
-    return "\n\n".join(context), audit
+    return "\n\n".join(context_chunks), audit_rows
 
 # =====================================================
-# GAP ANALYSIS PROMPT
+# GAP ANALYSIS (LLM)
 # =====================================================
 SYSTEM_PROMPT = """
-You are an ESG regulatory expert.
-Use only provided context.
-Return STRICT JSON.
+You are an ESG regulatory and sustainability reporting expert.
+Use ONLY the provided regulatory context.
+Return STRICT valid JSON only.
 """
 
 def run_gap_analysis(kpi_id, kpi_name, context, schema_cols, data_cols):
@@ -106,6 +106,12 @@ SCHEMA COLUMNS:
 DATA COLUMNS:
 {data_cols}
 
+TASK:
+1. Identify required fields from context
+2. Match with schema & data
+3. Decide feasibility
+4. List available and missing fields
+
 Return JSON:
 {{
   "feasibility": "FULLY_CALCULABLE | PARTIALLY_CALCULABLE | NOT_CALCULABLE",
@@ -116,7 +122,7 @@ Return JSON:
 }}
 """
 
-    res = openai_client.chat.completions.create(
+    response = openai_client.chat.completions.create(
         model="gpt-4.1",
         temperature=0,
         messages=[
@@ -125,12 +131,12 @@ Return JSON:
         ]
     )
 
-    return json.loads(res.choices[0].message.content)
+    return json.loads(response.choices[0].message.content)
 
 # =====================================================
-# AUDIT SCORE
+# AUDIT SCORE (DETERMINISTIC)
 # =====================================================
-def calculate_audit_score(result, audit):
+def calculate_audit_score(result, audit_rows):
     score = 0
 
     if result["feasibility"] == "FULLY_CALCULABLE":
@@ -139,68 +145,87 @@ def calculate_audit_score(result, audit):
         score += 20
 
     score += min(len(result["available_fields"]) * 5, 30)
-    score += min(len(audit) * 5, 30)
+    score += min(len(audit_rows) * 5, 30)
 
     return min(score, 100)
 
 # =====================================================
-# FILE PICKERS (FROM REPO)
+# FILE PICKERS (DROPDOWN FROM REPO)
 # =====================================================
 BASE_PATH = "data"
-excel_files = [f for f in os.listdir(BASE_PATH) if f.endswith(".xlsx")]
+
+if not os.path.exists(BASE_PATH):
+    os.makedirs(BASE_PATH)
+
+excel_files = [
+    f for f in os.listdir(BASE_PATH)
+    if f.lower().endswith(".xlsx")
+]
+
+if not excel_files:
+    st.error("No Excel files found in /data folder. Please add files to the repo.")
+    st.stop()
 
 st.sidebar.header("Input Files")
 
-kpi_file = st.sidebar.selectbox("KPI Master", excel_files)
+kpi_file = st.sidebar.selectbox("KPI Master File", excel_files)
 schema_file = st.sidebar.selectbox("Schema File", excel_files)
-data_file = st.sidebar.selectbox("Sample Data", ["None"] + excel_files)
+data_file = st.sidebar.selectbox("Sample Data (optional)", ["None"] + excel_files)
 
 # =====================================================
 # LOAD FILES
 # =====================================================
 kpi_df = pd.read_excel(os.path.join(BASE_PATH, kpi_file))
 schema_df = pd.read_excel(os.path.join(BASE_PATH, schema_file))
-data_df = pd.read_excel(os.path.join(BASE_PATH, data_file)) if data_file != "None" else None
+
+data_df = None
+if data_file != "None":
+    data_df = pd.read_excel(os.path.join(BASE_PATH, data_file))
 
 # =====================================================
 # KPI SELECTION
 # =====================================================
 selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
-row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
+kpi_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 
 # =====================================================
-# RUN
+# RUN ANALYSIS
 # =====================================================
 if st.button("Run Gap Analysis"):
 
     with st.spinner("Retrieving regulatory context..."):
-        context, audit = retrieve_context_with_audit(selected_kpi)
+        context, audit_rows = retrieve_context_with_audit(selected_kpi)
 
-    schema_cols = schema_df["column_name"].astype(str).tolist()
+    schema_cols = schema_df.iloc[:, 0].astype(str).tolist()
     data_cols = data_df.columns.tolist() if data_df is not None else []
 
-    with st.spinner("Running analysis..."):
+    with st.spinner("Running AI gap analysis..."):
         result = run_gap_analysis(
-            row["KPI ID"],
+            kpi_row["KPI ID"],
             selected_kpi,
             context,
             schema_cols,
             data_cols
         )
 
-    audit_score = calculate_audit_score(result, audit)
+    audit_score = calculate_audit_score(result, audit_rows)
 
-    # Update KPI table
-    kpi_df.loc[row.name, "Feasibility"] = result["feasibility"]
-    kpi_df.loc[row.name, "Available Columns"] = ", ".join(result["available_fields"])
-    kpi_df.loc[row.name, "Missing Columns"] = ", ".join(result["missing_fields"])
-    kpi_df.loc[row.name, "Audit Score"] = audit_score
-    kpi_df.loc[row.name, "Reason"] = result["reasoning"]
+    # =================================================
+    # UPDATE KPI TABLE
+    # =================================================
+    kpi_df.loc[kpi_row.name, "Feasibility"] = result["feasibility"]
+    kpi_df.loc[kpi_row.name, "Available Columns"] = ", ".join(result["available_fields"])
+    kpi_df.loc[kpi_row.name, "Missing Columns"] = ", ".join(result["missing_fields"])
+    kpi_df.loc[kpi_row.name, "Audit Score"] = audit_score
+    kpi_df.loc[kpi_row.name, "Reason"] = result["reasoning"]
 
-    st.success("Analysis complete")
+    st.success("Gap analysis completed")
 
-    st.subheader("Audit Trace")
-    st.dataframe(pd.DataFrame(audit))
+    # =================================================
+    # OUTPUTS
+    # =================================================
+    st.subheader("Audit Trace (from Qdrant)")
+    st.dataframe(pd.DataFrame(audit_rows), use_container_width=True)
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
@@ -210,7 +235,7 @@ if st.button("Run Gap Analysis"):
     buffer.seek(0)
 
     st.download_button(
-        "Download Updated KPI File",
+        "Download Updated KPI Excel",
         buffer,
         "kpi_gap_analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

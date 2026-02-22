@@ -3,7 +3,6 @@ import pandas as pd
 import json
 import os
 from io import BytesIO
-from uuid import uuid4
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -43,13 +42,8 @@ REGULATORY_COLLECTIONS = [
     "esg_regulations"
 ]
 
-SUPPORTING_COLLECTIONS = [
-    "client_bor",
-    "msm_dataverse_model"
-]
-
 # =====================================================
-# EMBEDDING (ALL 1536)
+# EMBEDDING (1536)
 # =====================================================
 def embed(text: str):
     return llm_client.embeddings.create(
@@ -58,13 +52,13 @@ def embed(text: str):
     ).data[0].embedding
 
 # =====================================================
-# UTILS
+# HELPERS
 # =====================================================
-def normalize(col):
+def norm(col):
     return col.strip().lower().replace(" ", "_")
 
 # =====================================================
-# REGULATORY CONTEXT + AUDIT
+# RETRIEVE REGULATORY CONTEXT + AUDIT
 # =====================================================
 def retrieve_regulatory_context(kpi_name: str):
     vector = embed(kpi_name)
@@ -80,9 +74,15 @@ def retrieve_regulatory_context(kpi_name: str):
         )
 
         for p in results.points:
-            payload = p.payload
+            payload = p.payload or {}
 
-            text = payload.get("content")
+            text = (
+                payload.get("content")
+                or payload.get("text")
+                or payload.get("document")
+                or ""
+            )
+
             if not text:
                 continue
 
@@ -98,11 +98,11 @@ def retrieve_regulatory_context(kpi_name: str):
     return "\n\n".join(context), audit
 
 # =====================================================
-# GAP ANALYSIS PROMPT
+# LLM GAP ANALYSIS
 # =====================================================
 SYSTEM_PROMPT = """
 You are an ESG regulatory expert.
-Use ONLY the regulatory context provided.
+Use ONLY the regulatory context.
 Return STRICT JSON only.
 """
 
@@ -115,7 +115,7 @@ REGULATORY CONTEXT:
 {regulatory_text}
 
 TASK:
-1. Identify REQUIRED data fields needed to calculate this KPI
+1. Identify REQUIRED fields
 2. Decide feasibility:
    FULLY_CALCULABLE / PARTIALLY_CALCULABLE / NOT_CALCULABLE
 3. Explain reasoning
@@ -147,110 +147,91 @@ BASE_PATH = "."
 
 excel_files = [f for f in os.listdir(BASE_PATH) if f.endswith(".xlsx")]
 
-kpi_file = st.selectbox(
-    "Select KPI Master File",
-    excel_files
-)
-
-schema_file = st.selectbox(
-    "Select Schema File",
-    excel_files
-)
-
-data_file = st.selectbox(
-    "Select Sample Data File",
-    excel_files
-)
+kpi_file = st.selectbox("Select KPI Master File", excel_files)
+schema_file = st.selectbox("Select Schema File", excel_files)
+data_file = st.selectbox("Select Sample Data File", excel_files)
 
 kpi_df = pd.read_excel(kpi_file)
 schema_df = pd.read_excel(schema_file)
 data_df = pd.read_excel(data_file)
 
 # =====================================================
+# ENSURE COLUMNS EXIST (NO DUPLICATES)
+# =====================================================
+for col in [
+    "Feasibility",
+    "Available Columns",
+    "Missing Columns",
+    "Audit Score",
+    "Reason"
+]:
+    if col not in kpi_df.columns:
+        kpi_df[col] = ""
+
+# =====================================================
 # KPI SELECTION
 # =====================================================
-selected_kpi = st.selectbox(
-    "Select KPI",
-    kpi_df["KPI Name"]
-)
+selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
 
-kpi_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
-kpi_id = kpi_row["KPI ID"]
+row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
+kpi_id = row["KPI ID"]
 
 # =====================================================
 # RUN ANALYSIS
 # =====================================================
 if st.button("Run Gap Analysis"):
 
-    # ---- Available Columns (deterministic) ----
+    # ---- Available columns (deterministic) ----
     schema_cols = schema_df.iloc[:, 0].astype(str).tolist()
-    data_cols = data_df.columns.astype(str).tolist()
+    data_cols = list(map(str, data_df.columns))
 
-    schema_norm = {normalize(c): c for c in schema_cols}
-    data_norm = {normalize(c): c for c in data_cols}
-
-    available_norm = set(schema_norm) | set(data_norm)
-    available_cols = sorted(
-        schema_norm.get(c, data_norm.get(c)) for c in available_norm
-    )
+    available_norm = {norm(c): c for c in schema_cols + data_cols}
 
     # ---- Regulatory context ----
     regulatory_text, audit_trace = retrieve_regulatory_context(selected_kpi)
 
-    # ---- LLM analysis ----
+    # ---- LLM ----
     raw = run_gap_analysis(kpi_id, selected_kpi, regulatory_text)
+    result = json.loads(raw)
 
-    try:
-        result = json.loads(raw)
-    except Exception:
-        st.error("Invalid LLM output")
-        st.code(raw)
-        st.stop()
-
-    # ---- Missing columns (deterministic) ----
-    required_norm = [normalize(c) for c in result["required_fields"]]
+    required_norm = [norm(c) for c in result["required_fields"]]
 
     missing_cols = [
         c for c in result["required_fields"]
-        if normalize(c) not in available_norm
+        if norm(c) not in available_norm
     ]
 
-    # ---- Audit score ----
-    if len(result["required_fields"]) == 0:
-        audit_score = 0
-    else:
-        audit_score = round(
-            100 * (1 - len(missing_cols) / len(result["required_fields"])),
-            1
-        )
+    available_cols = sorted(available_norm.values())
 
-    # =================================================
-    # UPDATE KPI TABLE
-    # =================================================
+    # ---- Audit score ----
+    audit_score = (
+        0 if not result["required_fields"]
+        else round(100 * (1 - len(missing_cols) / len(result["required_fields"])), 1)
+    )
+
     idx = kpi_df[kpi_df["KPI Name"] == selected_kpi].index[0]
 
     kpi_df.loc[idx, "Feasibility"] = result["feasibility"]
-    kpi_df.loc[idx, "Column names which are available"] = ", ".join(available_cols)
-    kpi_df.loc[idx, "Column names which are required more"] = ", ".join(missing_cols)
+    kpi_df.loc[idx, "Available Columns"] = ", ".join(available_cols)
+    kpi_df.loc[idx, "Missing Columns"] = ", ".join(missing_cols)
     kpi_df.loc[idx, "Audit Score"] = audit_score
     kpi_df.loc[idx, "Reason"] = result["reasoning"]
 
     # =================================================
-    # OUTPUTS
+    # OUTPUT
     # =================================================
-    st.subheader("Audit Trace (Vector DB Evidence)")
+    st.subheader("Audit Trace (Regulatory Evidence Only)")
     st.dataframe(pd.DataFrame(audit_trace), use_container_width=True)
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
 
-    # ---- Download ----
     output = BytesIO()
     kpi_df.to_excel(output, index=False)
     output.seek(0)
 
     st.download_button(
-        "Download Updated KPI File",
+        "Download KPI Gap Analysis",
         data=output,
         file_name="KPI_Gap_Analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

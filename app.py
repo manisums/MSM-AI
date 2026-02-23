@@ -18,14 +18,14 @@ st.set_page_config(
 st.title("MSM ESG KPI Gap Analysis Engine")
 
 # =========================
-# SECRETS (STREAMLIT CLOUD)
+# SECRETS
 # =========================
 try:
     QDRANT_URL = st.secrets["QDRANT_URL"]
     QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 except KeyError:
-    st.error("Secrets not found. Please configure secrets in Streamlit Cloud.")
+    st.error("Secrets not found. Please configure secrets.")
     st.stop()
 
 # =========================
@@ -55,7 +55,7 @@ if not excel_files:
     st.stop()
 
 # =========================
-# EMBEDDING FUNCTIONS
+# EMBEDDING (ONLY 1536)
 # =========================
 def embed_1536(text: str):
     return llm_client.embeddings.create(
@@ -63,21 +63,14 @@ def embed_1536(text: str):
         input=text
     ).data[0].embedding
 
-
-def embed_3072(text: str):
-    return llm_client.embeddings.create(
-        model="text-embedding-3-large",
-        input=text
-    ).data[0].embedding
-
 # =========================
-# COLLECTION CONFIG
+# COLLECTIONS (ALL 1536)
 # =========================
-COLLECTION_CONFIG = {
-    "esg_regulations": 1536,
-    "esrs_e1": 1536,
-    "client_bor": 3072
-}
+COLLECTIONS = [
+    "esg_regulations",
+    "esrs_e1",
+    "client_bor"
+]
 
 # =========================
 # RETRIEVE REGULATORY CONTEXT
@@ -86,19 +79,17 @@ def retrieve_regulatory_context(query: str) -> str:
 
     texts = []
 
-    for collection, dim in COLLECTION_CONFIG.items():
+    query_vector = embed_1536(query)
 
-        query_vector = (
-            embed_3072(query) if dim == 3072 else embed_1536(query)
-        )
+    for collection in COLLECTIONS:
 
-        results = qdrant_client.query_points(
+        results = qdrant_client.search(
             collection_name=collection,
-            query=query_vector,
+            query_vector=query_vector,
             limit=6
         )
 
-        for point in results.points:
+        for point in results:
             txt = (
                 point.payload.get("text")
                 or point.payload.get("document")

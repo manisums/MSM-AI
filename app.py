@@ -3,7 +3,6 @@ import pandas as pd
 import json
 import os
 from io import BytesIO
-from uuid import uuid4
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -11,7 +10,10 @@ from qdrant_client import QdrantClient
 # =====================================================
 # STREAMLIT CONFIG
 # =====================================================
-st.set_page_config(page_title="MSM ESG KPI Gap Analysis Engine", layout="wide")
+st.set_page_config(
+    page_title="MSM ESG KPI Gap Analysis Engine",
+    layout="wide"
+)
 st.title("MSM ESG KPI Gap Analysis Engine")
 
 # =====================================================
@@ -30,7 +32,7 @@ qdrant_client = QdrantClient(
 )
 
 # =====================================================
-# SAFE JSON PARSER (CRITICAL)
+# SAFE JSON PARSER (NO MORE CRASHES)
 # =====================================================
 def safe_json_parse(text: str):
     try:
@@ -48,7 +50,7 @@ def safe_json_parse(text: str):
         st.stop()
 
 # =====================================================
-# EMBEDDING
+# EMBEDDING (1536 – text-embedding-3-small)
 # =====================================================
 def embed(text: str):
     return llm_client.embeddings.create(
@@ -57,10 +59,99 @@ def embed(text: str):
     ).data[0].embedding
 
 # =====================================================
-# RETRIEVE REGULATORY CONTEXT (ONLY REQUIRED SOURCES)
+# FIND ALL EXCEL FILES (RECURSIVE FIX)
+# =====================================================
+def find_excel_files(base_path="."):
+    excel_files = []
+    for root, _, files in os.walk(base_path):
+        for f in files:
+            if f.lower().endswith(".xlsx"):
+                excel_files.append(os.path.join(root, f))
+    return sorted(excel_files)
+
+excel_files = find_excel_files(".")
+
+if not excel_files:
+    st.error("No Excel files found in the repository")
+    st.stop()
+
+# =====================================================
+# KPI MASTER FILE (DEFAULT = Excel.xlsx)
+# =====================================================
+default_kpi_idx = 0
+for i, f in enumerate(excel_files):
+    if os.path.basename(f).lower() == "excel.xlsx":
+        default_kpi_idx = i
+        break
+
+kpi_master_file = st.selectbox(
+    "Select KPI Master File",
+    excel_files,
+    index=default_kpi_idx
+)
+
+kpi_df = pd.read_excel(kpi_master_file)
+
+# =====================================================
+# CLEAN & STANDARDIZE KPI MASTER COLUMNS
+# =====================================================
+COLUMN_MAP = {
+    "Feasiblity": "Feasibility",
+    "Column names which are available": "Available Columns",
+    "Column name which are required more": "Missing Columns"
+}
+
+kpi_df.rename(columns=COLUMN_MAP, inplace=True)
+
+FINAL_COLUMNS = [
+    "KPI ID",
+    "KPI Name",
+    "Feasibility",
+    "Available Columns",
+    "Missing Columns",
+    "Audit Score",
+    "Reason"
+]
+
+for col in FINAL_COLUMNS:
+    if col not in kpi_df.columns:
+        kpi_df[col] = ""
+
+kpi_df = kpi_df[FINAL_COLUMNS]
+
+# =====================================================
+# KPI SELECTION
+# =====================================================
+selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
+kpi_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
+kpi_id = kpi_row["KPI ID"]
+
+# =====================================================
+# SCHEMA & SAMPLE DATA FILES
+# =====================================================
+schema_file = st.selectbox(
+    "Select Schema File",
+    [f for f in excel_files if "schema" in os.path.basename(f).lower()]
+)
+
+data_file = st.selectbox(
+    "Select Sample Data File",
+    [f for f in excel_files if "data" in os.path.basename(f).lower()]
+)
+
+schema_df = pd.read_excel(schema_file)
+data_df = pd.read_excel(data_file)
+
+schema_columns = set(schema_df.iloc[:, 0].astype(str).str.lower())
+data_columns = set(data_df.columns.astype(str).str.lower())
+
+available_columns = sorted(schema_columns & data_columns)
+
+# =====================================================
+# RETRIEVE REGULATORY CONTEXT (ONLY REQUIRED COLLECTIONS)
 # =====================================================
 def retrieve_regulatory_context(query: str):
-    audit = []
+    audit_sources = set()
     texts = []
 
     for collection in ["esg_regulations", "esrs_e1"]:
@@ -74,9 +165,9 @@ def retrieve_regulatory_context(query: str):
             content = p.payload.get("content", "")
             if content:
                 texts.append(content)
-                audit.append(collection)
+                audit_sources.add(collection)
 
-    return "\n\n".join(texts), list(set(audit))
+    return "\n\n".join(texts), list(audit_sources)
 
 # =====================================================
 # REGULATORY GAP ANALYSIS
@@ -92,7 +183,6 @@ REGULATORY CONTEXT:
 
 Return ONLY valid JSON.
 
-JSON FORMAT:
 {{
   "feasibility": "",
   "required_fields": [],
@@ -110,78 +200,6 @@ JSON FORMAT:
     return safe_json_parse(res.choices[0].message.content)
 
 # =====================================================
-# FILE SELECTION
-# =====================================================
-st.subheader("Select KPI Master File")
-
-files = [f for f in os.listdir(".") if f.lower().endswith(".xlsx")]
-
-default_idx = 0
-for i, f in enumerate(files):
-    if f.lower() == "excel.xlsx":
-        default_idx = i
-        break
-
-kpi_master_file = st.selectbox("KPI Master", files, index=default_idx)
-kpi_df = pd.read_excel(kpi_master_file)
-
-# =====================================================
-# CLEAN & STANDARDIZE COLUMNS (FIXED)
-# =====================================================
-COLUMN_MAP = {
-    "Column names which are available": "Available Columns",
-    "Column name which are required more": "Missing Columns",
-    "Feasiblity": "Feasibility"
-}
-
-kpi_df.rename(columns=COLUMN_MAP, inplace=True)
-
-FINAL_COLUMNS = [
-    "KPI ID",
-    "KPI Name",
-    "Feasibility",
-    "Available Columns",
-    "Missing Columns",
-    "Audit Score",
-    "Reason"
-]
-
-for c in FINAL_COLUMNS:
-    if c not in kpi_df.columns:
-        kpi_df[c] = ""
-
-kpi_df = kpi_df[FINAL_COLUMNS]
-
-# =====================================================
-# KPI SELECTION
-# =====================================================
-selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
-row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
-kpi_id = row["KPI ID"]
-
-# =====================================================
-# SCHEMA + DATA FILES
-# =====================================================
-st.subheader("Select Schema & Sample Data")
-
-schema_file = st.selectbox(
-    "Schema File",
-    [f for f in files if "schema" in f.lower()]
-)
-
-data_file = st.selectbox(
-    "Sample Data File",
-    [f for f in files if "data" in f.lower()]
-)
-
-schema_df = pd.read_excel(schema_file)
-data_df = pd.read_excel(data_file)
-
-schema_columns = set(schema_df.iloc[:, 0].astype(str).str.lower())
-data_columns = set(data_df.columns.astype(str).str.lower())
-available_columns = sorted(schema_columns & data_columns)
-
-# =====================================================
 # RUN ANALYSIS
 # =====================================================
 if st.button("Run Gap Analysis"):
@@ -195,8 +213,9 @@ if st.button("Run Gap Analysis"):
     required_fields = [f.lower() for f in reg_result["required_fields"]]
     missing_fields = sorted(set(required_fields) - set(available_columns))
 
-    audit_score = (
-        int((len(required_fields) - len(missing_fields)) / max(len(required_fields), 1) * 100)
+    audit_score = int(
+        (len(required_fields) - len(missing_fields)) /
+        max(len(required_fields), 1) * 100
     )
 
     idx = kpi_df["KPI Name"] == selected_kpi

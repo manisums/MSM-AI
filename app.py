@@ -35,8 +35,7 @@ llm_client = OpenAI(api_key=OPENAI_API_KEY)
 
 qdrant_client = QdrantClient(
     url=QDRANT_URL,
-    api_key=QDRANT_API_KEY,
-    check_compatibility=False
+    api_key=QDRANT_API_KEY
 )
 
 # =========================
@@ -81,15 +80,13 @@ def retrieve_regulatory_context(query: str) -> str:
 
     for collection in COLLECTIONS:
 
-        response = qdrant_client.http.search_api.search_points(
+        results = qdrant_client.search_points(
             collection_name=collection,
-            search_request={
-                "vector": query_vector,
-                "limit": 6
-            }
+            vector=query_vector,
+            limit=6
         )
 
-        for point in response.result:
+        for point in results:
             txt = (
                 point.payload.get("text")
                 or point.payload.get("document")
@@ -205,10 +202,6 @@ if st.button("Run Gap Analysis"):
     schema_text = "\n".join(
         schema_df.astype(str).agg(" | ".join, axis=1)
     )
-
-    # Sample data intentionally preserved but not used
-    if data_file_name != "None":
-        _ = pd.read_excel(data_file_name)
 
     with st.spinner("Retrieving regulatory context..."):
         reg_text = retrieve_regulatory_context(selected_kpi)

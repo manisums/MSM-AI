@@ -35,15 +35,12 @@ qdrant_client = QdrantClient(
 )
 
 # =====================================================
-# COLLECTION ROLES
+# COLLECTION ROLES (LOCKED)
 # =====================================================
-REGULATORY_COLLECTIONS = [
-    "esrs_e1",
-    "esg_regulations"
-]
+REGULATORY_COLLECTIONS = ["esrs_e1", "esg_regulations"]
 
 # =====================================================
-# EMBEDDING (1536)
+# EMBEDDING (ALL 1536)
 # =====================================================
 def embed(text: str):
     return llm_client.embeddings.create(
@@ -58,10 +55,10 @@ def norm(col):
     return col.strip().lower().replace(" ", "_")
 
 # =====================================================
-# RETRIEVE REGULATORY CONTEXT + AUDIT
+# REGULATORY CONTEXT (FEASIBILITY)
 # =====================================================
-def retrieve_regulatory_context(kpi_name: str):
-    vector = embed(kpi_name)
+def retrieve_regulatory_context(query: str):
+    vector = embed(query)
 
     context = []
     audit = []
@@ -82,15 +79,12 @@ def retrieve_regulatory_context(kpi_name: str):
                 or payload.get("document")
                 or ""
             )
-
             if not text:
                 continue
 
             context.append(text)
-
             audit.append({
                 "collection": collection,
-                "doc_type": payload.get("doc_type"),
                 "source": payload.get("source"),
                 "page": payload.get("page")
             })
@@ -98,18 +92,75 @@ def retrieve_regulatory_context(kpi_name: str):
     return "\n\n".join(context), audit
 
 # =====================================================
-# LLM GAP ANALYSIS
+# MSM CONTEXT (TECHNICAL FEASIBILITY)
 # =====================================================
-SYSTEM_PROMPT = """
-You are an ESG regulatory expert.
-Use ONLY the regulatory context.
-Return STRICT JSON only.
-"""
+def retrieve_msm_context(query: str):
+    vector = embed(query)
 
-def run_gap_analysis(kpi_id, kpi_name, regulatory_text):
-    USER_PROMPT = f"""
+    results = qdrant_client.query_points(
+        collection_name="msm_dataverse_model",
+        query=vector,
+        limit=6
+    )
+
+    context = []
+    audit = []
+
+    for p in results.points:
+        payload = p.payload or {}
+        text = payload.get("content")
+        if not text:
+            continue
+
+        context.append(text)
+        audit.append({
+            "collection": "msm_dataverse_model",
+            "source": payload.get("source"),
+            "page": None
+        })
+
+    return "\n\n".join(context), audit
+
+# =====================================================
+# BOR CONTEXT (CALCULATION JUSTIFICATION)
+# =====================================================
+def retrieve_bor_context(query: str):
+    vector = embed(query)
+
+    results = qdrant_client.query_points(
+        collection_name="client_bor",
+        query=vector,
+        limit=4
+    )
+
+    context = []
+    audit = []
+
+    for p in results.points:
+        payload = p.payload or {}
+        text = payload.get("content")
+        if not text:
+            continue
+
+        context.append(text)
+        audit.append({
+            "collection": "client_bor",
+            "source": payload.get("source"),
+            "page": payload.get("page")
+        })
+
+    return "\n\n".join(context), audit
+
+# =====================================================
+# LLM – REGULATORY GAP ANALYSIS
+# =====================================================
+def run_regulatory_gap_analysis(kpi_id, kpi_name, regulatory_text):
+
+    prompt = f"""
+You are an ESG regulatory expert.
+
 KPI ID: {kpi_id}
-KPI NAME: {kpi_name}
+KPI Name: {kpi_name}
 
 REGULATORY CONTEXT:
 {regulatory_text}
@@ -120,7 +171,7 @@ TASK:
    FULLY_CALCULABLE / PARTIALLY_CALCULABLE / NOT_CALCULABLE
 3. Explain reasoning
 
-Return JSON ONLY:
+Return STRICT JSON:
 
 {{
   "feasibility": "",
@@ -131,20 +182,65 @@ Return JSON ONLY:
 
     response = llm_client.chat.completions.create(
         model="gpt-4.1",
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT}
-        ]
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.choices[0].message.content
+    return json.loads(response.choices[0].message.content)
 
 # =====================================================
-# LOAD FILES FROM REPO
+# LLM – MSM TECHNICAL GAP
+# =====================================================
+def run_msm_gap_analysis(kpi_id, kpi_name, msm_text):
+
+    prompt = f"""
+You are a Microsoft Sustainability Manager data model expert.
+
+KPI ID: {kpi_id}
+KPI Name: {kpi_name}
+
+MSM DATA MODEL CONTEXT:
+{msm_text}
+
+TASK:
+1. Identify required MSM fields
+2. Decide feasibility:
+   FULLY_CALCULABLE / PARTIALLY_CALCULABLE / NOT_CALCULABLE
+3. List available fields
+4. List missing fields
+5. Explain reasoning
+
+Return STRICT JSON:
+
+{{
+  "feasibility": "",
+  "available_fields": [],
+  "missing_fields": [],
+  "reasoning": ""
+}}
+"""
+
+    response = llm_client.chat.completions.create(
+        model="gpt-4.1",
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+# =====================================================
+# KPI COMPUTATION (NON-MSM)
+# =====================================================
+def compute_kpi_value(kpi_id, data_df):
+    numeric_cols = data_df.select_dtypes(include="number")
+    if numeric_cols.empty:
+        return None
+    return round(numeric_cols.sum().sum(), 2)
+
+# =====================================================
+# LOAD FILES (FROM REPO)
 # =====================================================
 BASE_PATH = "."
-
 excel_files = [f for f in os.listdir(BASE_PATH) if f.endswith(".xlsx")]
 
 kpi_file = st.selectbox("Select KPI Master File", excel_files)
@@ -156,12 +252,15 @@ schema_df = pd.read_excel(schema_file)
 data_df = pd.read_excel(data_file)
 
 # =====================================================
-# ENSURE COLUMNS EXIST (NO DUPLICATES)
+# ENSURE OUTPUT COLUMNS (NO DUPLICATES)
 # =====================================================
 for col in [
     "Feasibility",
     "Available Columns",
     "Missing Columns",
+    "Mapping to MSM",
+    "KPI Value",
+    "Calculation Source",
     "Audit Score",
     "Reason"
 ]:
@@ -172,7 +271,6 @@ for col in [
 # KPI SELECTION
 # =====================================================
 selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
-
 row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 kpi_id = row["KPI ID"]
 
@@ -184,43 +282,77 @@ if st.button("Run Gap Analysis"):
     # ---- Available columns (deterministic) ----
     schema_cols = schema_df.iloc[:, 0].astype(str).tolist()
     data_cols = list(map(str, data_df.columns))
-
     available_norm = {norm(c): c for c in schema_cols + data_cols}
 
-    # ---- Regulatory context ----
-    regulatory_text, audit_trace = retrieve_regulatory_context(selected_kpi)
+    # ---- REGULATORY ----
+    reg_text, reg_audit = retrieve_regulatory_context(selected_kpi)
+    reg_result = run_regulatory_gap_analysis(kpi_id, selected_kpi, reg_text)
 
-    # ---- LLM ----
-    raw = run_gap_analysis(kpi_id, selected_kpi, regulatory_text)
-    result = json.loads(raw)
-
-    required_norm = [norm(c) for c in result["required_fields"]]
-
-    missing_cols = [
-        c for c in result["required_fields"]
-        if norm(c) not in available_norm
-    ]
-
+    required_norm = [norm(c) for c in reg_result["required_fields"]]
+    missing_cols = [c for c in reg_result["required_fields"] if norm(c) not in available_norm]
     available_cols = sorted(available_norm.values())
 
-    # ---- Audit score ----
     audit_score = (
-        0 if not result["required_fields"]
-        else round(100 * (1 - len(missing_cols) / len(result["required_fields"])), 1)
+        0 if not reg_result["required_fields"]
+        else round(100 * (1 - len(missing_cols) / len(reg_result["required_fields"])), 1)
     )
 
     idx = kpi_df[kpi_df["KPI Name"] == selected_kpi].index[0]
 
-    kpi_df.loc[idx, "Feasibility"] = result["feasibility"]
+    kpi_df.loc[idx, "Feasibility"] = reg_result["feasibility"]
     kpi_df.loc[idx, "Available Columns"] = ", ".join(available_cols)
     kpi_df.loc[idx, "Missing Columns"] = ", ".join(missing_cols)
     kpi_df.loc[idx, "Audit Score"] = audit_score
-    kpi_df.loc[idx, "Reason"] = result["reasoning"]
+    kpi_df.loc[idx, "Reason"] = reg_result["reasoning"]
+
+    # =================================================
+    # MSM DECISION
+    # =================================================
+    st.subheader("MSM Mapping Decision")
+
+    map_to_msm = st.radio(
+        "Should this KPI be mapped to MSM?",
+        ["Yes", "No"],
+        horizontal=True
+    )
+
+    # =================================================
+    # MSM = YES
+    # =================================================
+    if map_to_msm == "Yes":
+        msm_text, msm_audit = retrieve_msm_context(selected_kpi)
+        msm_result = run_msm_gap_analysis(kpi_id, selected_kpi, msm_text)
+
+        kpi_df.loc[idx, "Mapping to MSM"] = "Yes"
+        kpi_df.loc[idx, "Feasibility"] = msm_result["feasibility"]
+        kpi_df.loc[idx, "Available Columns"] = ", ".join(msm_result["available_fields"])
+        kpi_df.loc[idx, "Missing Columns"] = ", ".join(msm_result["missing_fields"])
+        kpi_df.loc[idx, "Calculation Source"] = "MSM Dataverse"
+        kpi_df.loc[idx, "KPI Value"] = ""
+
+        audit_trace = msm_audit
+
+    # =================================================
+    # MSM = NO → COMPUTE KPI + BOR JUSTIFICATION
+    # =================================================
+    else:
+        kpi_value = compute_kpi_value(kpi_id, data_df)
+        bor_text, bor_audit = retrieve_bor_context(selected_kpi)
+
+        kpi_df.loc[idx, "Mapping to MSM"] = "No"
+        kpi_df.loc[idx, "KPI Value"] = kpi_value
+        kpi_df.loc[idx, "Calculation Source"] = "Derived (Non-MSM)"
+        kpi_df.loc[idx, "Reason"] = (
+            "KPI computed using transactional data. "
+            "Methodology and boundaries justified using Basis of Reporting."
+        )
+
+        audit_trace = bor_audit
 
     # =================================================
     # OUTPUT
     # =================================================
-    st.subheader("Audit Trace (Regulatory Evidence Only)")
+    st.subheader("Audit Traceability")
     st.dataframe(pd.DataFrame(audit_trace), use_container_width=True)
 
     st.subheader("Updated KPI Table")

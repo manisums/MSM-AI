@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import os
 from io import BytesIO
+from uuid import uuid4
 
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -10,10 +11,7 @@ from qdrant_client import QdrantClient
 # =====================================================
 # STREAMLIT CONFIG
 # =====================================================
-st.set_page_config(
-    page_title="MSM ESG KPI Gap Analysis Engine",
-    layout="wide"
-)
+st.set_page_config(page_title="MSM ESG KPI Gap Analysis Engine", layout="wide")
 st.title("MSM ESG KPI Gap Analysis Engine")
 
 # =====================================================
@@ -23,10 +21,8 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 QDRANT_URL = st.secrets["QDRANT_URL"]
 QDRANT_API_KEY = st.secrets["QDRANT_API_KEY"]
 
-# =====================================================
-# CLIENTS
-# =====================================================
 llm_client = OpenAI(api_key=OPENAI_API_KEY)
+
 qdrant_client = QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY,
@@ -34,12 +30,7 @@ qdrant_client = QdrantClient(
 )
 
 # =====================================================
-# CONSTANTS
-# =====================================================
-REGULATORY_COLLECTIONS = ["esrs_e1", "esg_regulations"]
-
-# =====================================================
-# SAFE JSON PARSER (CRITICAL FIX)
+# SAFE JSON PARSER (CRITICAL)
 # =====================================================
 def safe_json_parse(text: str):
     try:
@@ -52,12 +43,12 @@ def safe_json_parse(text: str):
                 return json.loads(text[start:end])
             except Exception:
                 pass
-        st.error("LLM did not return valid JSON.")
+        st.error("Model did not return valid JSON")
         st.code(text)
         st.stop()
 
 # =====================================================
-# EMBEDDING (1536)
+# EMBEDDING
 # =====================================================
 def embed(text: str):
     return llm_client.embeddings.create(
@@ -66,96 +57,32 @@ def embed(text: str):
     ).data[0].embedding
 
 # =====================================================
-# NORMALIZER
+# RETRIEVE REGULATORY CONTEXT (ONLY REQUIRED SOURCES)
 # =====================================================
-def norm(col):
-    return col.strip().lower().replace(" ", "_")
+def retrieve_regulatory_context(query: str):
+    audit = []
+    texts = []
 
-# =====================================================
-# REGULATORY CONTEXT (ESRS + ESG)
-# =====================================================
-def retrieve_regulatory_context(kpi_name):
-    vector = embed(kpi_name)
-    context, audit = [], []
-
-    for collection in REGULATORY_COLLECTIONS:
-        results = qdrant_client.query_points(
+    for collection in ["esg_regulations", "esrs_e1"]:
+        res = qdrant_client.query_points(
             collection_name=collection,
-            query=vector,
-            limit=4
+            query=embed(query),
+            limit=5
         )
 
-        for p in results.points:
-            payload = p.payload or {}
-            text = (
-                payload.get("content")
-                or payload.get("text")
-                or payload.get("document")
-            )
-            if not text:
-                continue
+        for p in res.points:
+            content = p.payload.get("content", "")
+            if content:
+                texts.append(content)
+                audit.append(collection)
 
-            context.append(text)
-            audit.append({
-                "collection": collection,
-                "source": payload.get("source"),
-                "page": payload.get("page")
-            })
-
-    return "\n\n".join(context), audit
+    return "\n\n".join(texts), list(set(audit))
 
 # =====================================================
-# MSM CONTEXT
-# =====================================================
-def retrieve_msm_context(kpi_name):
-    vector = embed(kpi_name)
-    results = qdrant_client.query_points(
-        collection_name="msm_dataverse_model",
-        query=vector,
-        limit=6
-    )
-
-    context, audit = [], []
-    for p in results.points:
-        payload = p.payload or {}
-        if payload.get("content"):
-            context.append(payload["content"])
-            audit.append({
-                "collection": "msm_dataverse_model",
-                "source": payload.get("source"),
-                "page": None
-            })
-
-    return "\n\n".join(context), audit
-
-# =====================================================
-# BOR CONTEXT (FOR COMPUTED KPI)
-# =====================================================
-def retrieve_bor_context(kpi_name):
-    vector = embed(kpi_name)
-    results = qdrant_client.query_points(
-        collection_name="client_bor",
-        query=vector,
-        limit=4
-    )
-
-    context, audit = [], []
-    for p in results.points:
-        payload = p.payload or {}
-        if payload.get("content"):
-            context.append(payload["content"])
-            audit.append({
-                "collection": "client_bor",
-                "source": payload.get("source"),
-                "page": payload.get("page")
-            })
-
-    return "\n\n".join(context), audit
-
-# =====================================================
-# REGULATORY GAP ANALYSIS (JSON SAFE)
+# REGULATORY GAP ANALYSIS
 # =====================================================
 def run_regulatory_gap(kpi_id, kpi_name, reg_text):
+
     prompt = f"""
 KPI ID: {kpi_id}
 KPI Name: {kpi_name}
@@ -163,17 +90,16 @@ KPI Name: {kpi_name}
 REGULATORY CONTEXT:
 {reg_text}
 
-TASK:
-1. Identify required fields
-2. Decide feasibility
-
 Return ONLY valid JSON.
+
+JSON FORMAT:
 {{
   "feasibility": "",
   "required_fields": [],
   "reasoning": ""
 }}
 """
+
     res = llm_client.chat.completions.create(
         model="gpt-4.1",
         temperature=0,
@@ -184,163 +110,117 @@ Return ONLY valid JSON.
     return safe_json_parse(res.choices[0].message.content)
 
 # =====================================================
-# MSM GAP ANALYSIS (JSON SAFE)
+# FILE SELECTION
 # =====================================================
-def run_msm_gap(kpi_id, kpi_name, msm_text):
-    prompt = f"""
-KPI ID: {kpi_id}
-KPI Name: {kpi_name}
+st.subheader("Select KPI Master File")
 
-MSM DATA MODEL CONTEXT:
-{msm_text}
-
-Return ONLY valid JSON.
-{{
-  "feasibility": "",
-  "available_fields": [],
-  "missing_fields": [],
-  "reasoning": ""
-}}
-"""
-    res = llm_client.chat.completions.create(
-        model="gpt-4.1",
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    return safe_json_parse(res.choices[0].message.content)
-
-# =====================================================
-# KPI COMPUTATION (EMISSIONS)
-# =====================================================
-def compute_emission(data_df):
-    numeric_cols = data_df.select_dtypes(include="number")
-    return round(numeric_cols.sum().sum(), 2) if not numeric_cols.empty else None
-
-# =====================================================
-# FILE SELECTION (DEFAULT = Excel.xlsx)
-# =====================================================
 files = [f for f in os.listdir(".") if f.lower().endswith(".xlsx")]
 
-default_kpi_index = 0
+default_idx = 0
 for i, f in enumerate(files):
     if f.lower() == "excel.xlsx":
-        default_kpi_index = i
+        default_idx = i
         break
 
-kpi_file = st.selectbox(
-    "Select KPI Master File",
-    files,
-    index=default_kpi_index
-)
+kpi_master_file = st.selectbox("KPI Master", files, index=default_idx)
+kpi_df = pd.read_excel(kpi_master_file)
 
-kpi_df = pd.read_excel(kpi_file)
+# =====================================================
+# CLEAN & STANDARDIZE COLUMNS (FIXED)
+# =====================================================
+COLUMN_MAP = {
+    "Column names which are available": "Available Columns",
+    "Column name which are required more": "Missing Columns",
+    "Feasiblity": "Feasibility"
+}
 
+kpi_df.rename(columns=COLUMN_MAP, inplace=True)
+
+FINAL_COLUMNS = [
+    "KPI ID",
+    "KPI Name",
+    "Feasibility",
+    "Available Columns",
+    "Missing Columns",
+    "Audit Score",
+    "Reason"
+]
+
+for c in FINAL_COLUMNS:
+    if c not in kpi_df.columns:
+        kpi_df[c] = ""
+
+kpi_df = kpi_df[FINAL_COLUMNS]
+
+# =====================================================
+# KPI SELECTION
+# =====================================================
 selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
 row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
 kpi_id = row["KPI ID"]
 
-schema_file = st.selectbox("Select Schema File", files)
-data_file = st.selectbox("Select Sample Data File", files)
+# =====================================================
+# SCHEMA + DATA FILES
+# =====================================================
+st.subheader("Select Schema & Sample Data")
+
+schema_file = st.selectbox(
+    "Schema File",
+    [f for f in files if "schema" in f.lower()]
+)
+
+data_file = st.selectbox(
+    "Sample Data File",
+    [f for f in files if "data" in f.lower()]
+)
 
 schema_df = pd.read_excel(schema_file)
 data_df = pd.read_excel(data_file)
 
-# =====================================================
-# ENSURE OUTPUT COLUMNS
-# =====================================================
-for col in [
-    "Feasibility",
-    "Available Columns",
-    "Missing Columns",
-    "Mapping to MSM",
-    "KPI Value",
-    "Calculation Source",
-    "Audit Score",
-    "Reason"
-]:
-    if col not in kpi_df.columns:
-        kpi_df[col] = ""
+schema_columns = set(schema_df.iloc[:, 0].astype(str).str.lower())
+data_columns = set(data_df.columns.astype(str).str.lower())
+available_columns = sorted(schema_columns & data_columns)
 
 # =====================================================
-# RUN GAP ANALYSIS
+# RUN ANALYSIS
 # =====================================================
 if st.button("Run Gap Analysis"):
 
-    reg_text, reg_audit = retrieve_regulatory_context(selected_kpi)
-    reg_result = run_regulatory_gap(kpi_id, selected_kpi, reg_text)
+    with st.spinner("Retrieving regulatory context..."):
+        reg_text, audit_sources = retrieve_regulatory_context(selected_kpi)
 
-    schema_cols = schema_df.iloc[:, 0].astype(str).tolist()
-    data_cols = list(map(str, data_df.columns))
-    available = {norm(c): c for c in schema_cols + data_cols}
+    with st.spinner("Running regulatory gap analysis..."):
+        reg_result = run_regulatory_gap(kpi_id, selected_kpi, reg_text)
 
-    missing = [
-        c for c in reg_result["required_fields"]
-        if norm(c) not in available
-    ]
+    required_fields = [f.lower() for f in reg_result["required_fields"]]
+    missing_fields = sorted(set(required_fields) - set(available_columns))
 
-    idx = kpi_df[kpi_df["KPI Name"] == selected_kpi].index[0]
-
-    kpi_df.loc[idx, "Feasibility"] = reg_result["feasibility"]
-    kpi_df.loc[idx, "Available Columns"] = ", ".join(available.values())
-    kpi_df.loc[idx, "Missing Columns"] = ", ".join(missing)
-    kpi_df.loc[idx, "Audit Score"] = round(
-        100 * (1 - len(missing) / max(len(reg_result["required_fields"]), 1)), 1
+    audit_score = (
+        int((len(required_fields) - len(missing_fields)) / max(len(required_fields), 1) * 100)
     )
+
+    idx = kpi_df["KPI Name"] == selected_kpi
+    kpi_df.loc[idx, "Feasibility"] = reg_result["feasibility"]
+    kpi_df.loc[idx, "Available Columns"] = ", ".join(available_columns)
+    kpi_df.loc[idx, "Missing Columns"] = ", ".join(missing_fields)
+    kpi_df.loc[idx, "Audit Score"] = audit_score
     kpi_df.loc[idx, "Reason"] = reg_result["reasoning"]
 
-    st.subheader("Audit Traceability (Regulatory)")
-    st.dataframe(pd.DataFrame(reg_audit), use_container_width=True)
+    st.success("Gap analysis completed")
+
+    st.subheader("Audit Traceability")
+    st.write("Sources used:", ", ".join(audit_sources))
 
     st.subheader("Updated KPI Table")
     st.dataframe(kpi_df, use_container_width=True)
 
-    # =================================================
-    # MSM QUESTION (AFTER RESULTS)
-    # =================================================
-    st.subheader("MSM Mapping Decision")
-    map_msm = st.radio(
-        "Should this KPI be mapped to MSM?",
-        ["Yes", "No"],
-        horizontal=True
-    )
-
-    if map_msm == "Yes":
-        msm_text, msm_audit = retrieve_msm_context(selected_kpi)
-        msm_res = run_msm_gap(kpi_id, selected_kpi, msm_text)
-
-        kpi_df.loc[idx, "Mapping to MSM"] = "Yes"
-        kpi_df.loc[idx, "Feasibility"] = msm_res["feasibility"]
-        kpi_df.loc[idx, "Available Columns"] = ", ".join(msm_res["available_fields"])
-        kpi_df.loc[idx, "Missing Columns"] = ", ".join(msm_res["missing_fields"])
-        kpi_df.loc[idx, "Calculation Source"] = "MSM Dataverse"
-        kpi_df.loc[idx, "KPI Value"] = ""
-
-        st.subheader("MSM Audit Trace")
-        st.dataframe(pd.DataFrame(msm_audit), use_container_width=True)
-
-    else:
-        kpi_value = compute_emission(data_df)
-        _, bor_audit = retrieve_bor_context(selected_kpi)
-
-        kpi_df.loc[idx, "Mapping to MSM"] = "No"
-        kpi_df.loc[idx, "KPI Value"] = kpi_value
-        kpi_df.loc[idx, "Calculation Source"] = "Derived (Non-MSM)"
-
-        st.subheader("BoR Audit Trace")
-        st.dataframe(pd.DataFrame(bor_audit), use_container_width=True)
-
-    # =================================================
-    # DOWNLOAD
-    # =================================================
     output = BytesIO()
     kpi_df.to_excel(output, index=False)
     output.seek(0)
 
     st.download_button(
-        "Download KPI Analysis",
-        data=output,
-        file_name="KPI_Gap_Analysis.xlsx",
+        "Download Updated KPI File",
+        output,
+        "KPI_Gap_Analysis.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )

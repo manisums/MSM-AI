@@ -32,7 +32,7 @@ qdrant_client = QdrantClient(
 )
 
 # =====================================================
-# SAFE JSON PARSER (NO MORE CRASHES)
+# SAFE JSON PARSER
 # =====================================================
 def safe_json_parse(text: str):
     try:
@@ -50,7 +50,7 @@ def safe_json_parse(text: str):
         st.stop()
 
 # =====================================================
-# EMBEDDING (1536 – text-embedding-3-small)
+# EMBEDDING
 # =====================================================
 def embed(text: str):
     return llm_client.embeddings.create(
@@ -59,41 +59,41 @@ def embed(text: str):
     ).data[0].embedding
 
 # =====================================================
-# FIND ALL EXCEL FILES (RECURSIVE FIX)
+# FIND ALL EXCEL FILES (RECURSIVE – FINAL FIX)
 # =====================================================
 def find_excel_files(base_path="."):
-    excel_files = []
-    for root, _, files in os.walk(base_path):
-        for f in files:
+    files = []
+    for root, _, filenames in os.walk(base_path):
+        for f in filenames:
             if f.lower().endswith(".xlsx"):
-                excel_files.append(os.path.join(root, f))
-    return sorted(excel_files)
+                files.append(os.path.join(root, f))
+    return sorted(files)
 
 excel_files = find_excel_files(".")
 
 if not excel_files:
-    st.error("No Excel files found in the repository")
+    st.error("No Excel files found in repository")
     st.stop()
 
 # =====================================================
 # KPI MASTER FILE (DEFAULT = Excel.xlsx)
 # =====================================================
-default_kpi_idx = 0
+default_idx = 0
 for i, f in enumerate(excel_files):
     if os.path.basename(f).lower() == "excel.xlsx":
-        default_kpi_idx = i
+        default_idx = i
         break
 
 kpi_master_file = st.selectbox(
     "Select KPI Master File",
     excel_files,
-    index=default_kpi_idx
+    index=default_idx
 )
 
 kpi_df = pd.read_excel(kpi_master_file)
 
 # =====================================================
-# CLEAN & STANDARDIZE KPI MASTER COLUMNS
+# CLEAN KPI MASTER COLUMNS (STAGE 1 ONLY)
 # =====================================================
 COLUMN_MAP = {
     "Feasiblity": "Feasibility",
@@ -123,20 +123,22 @@ kpi_df = kpi_df[FINAL_COLUMNS]
 # KPI SELECTION
 # =====================================================
 selected_kpi = st.selectbox("Select KPI", kpi_df["KPI Name"])
-kpi_row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
-kpi_id = kpi_row["KPI ID"]
+row = kpi_df[kpi_df["KPI Name"] == selected_kpi].iloc[0]
+kpi_id = row["KPI ID"]
 
 # =====================================================
-# SCHEMA & SAMPLE DATA FILES
+# SCHEMA & SAMPLE DATA (SHOW ALL FILES – FIXED)
 # =====================================================
+st.subheader("Select Schema & Sample Data")
+
 schema_file = st.selectbox(
     "Select Schema File",
-    [f for f in excel_files if "schema" in os.path.basename(f).lower()]
+    excel_files
 )
 
 data_file = st.selectbox(
     "Select Sample Data File",
-    [f for f in excel_files if "data" in os.path.basename(f).lower()]
+    excel_files
 )
 
 schema_df = pd.read_excel(schema_file)
@@ -144,15 +146,14 @@ data_df = pd.read_excel(data_file)
 
 schema_columns = set(schema_df.iloc[:, 0].astype(str).str.lower())
 data_columns = set(data_df.columns.astype(str).str.lower())
-
 available_columns = sorted(schema_columns & data_columns)
 
 # =====================================================
-# RETRIEVE REGULATORY CONTEXT (ONLY REQUIRED COLLECTIONS)
+# RETRIEVE REGULATORY CONTEXT
 # =====================================================
 def retrieve_regulatory_context(query: str):
-    audit_sources = set()
     texts = []
+    audit_sources = set()
 
     for collection in ["esg_regulations", "esrs_e1"]:
         res = qdrant_client.query_points(
@@ -200,7 +201,7 @@ Return ONLY valid JSON.
     return safe_json_parse(res.choices[0].message.content)
 
 # =====================================================
-# RUN ANALYSIS
+# RUN GAP ANALYSIS
 # =====================================================
 if st.button("Run Gap Analysis"):
 

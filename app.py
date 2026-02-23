@@ -55,7 +55,7 @@ if not excel_files:
     st.stop()
 
 # =========================
-# EMBEDDING (ONLY 1536)
+# EMBEDDING (1536 ONLY)
 # =========================
 def embed_1536(text: str):
     return llm_client.embeddings.create(
@@ -64,12 +64,11 @@ def embed_1536(text: str):
     ).data[0].embedding
 
 # =========================
-# COLLECTIONS (ALL 1536)
+# COLLECTIONS (ONLY REQUIRED)
 # =========================
 COLLECTIONS = [
     "esg_regulations",
-    "esrs_e1",
-    "client_bor"
+    "esrs_e1"
 ]
 
 # =========================
@@ -78,14 +77,12 @@ COLLECTIONS = [
 def retrieve_regulatory_context(query: str) -> str:
 
     texts = []
-
     query_vector = embed_1536(query)
 
     for collection in COLLECTIONS:
-
-        results = qdrant_client.search(
+        results = qdrant_client.search_points(
             collection_name=collection,
-            query_vector=query_vector,
+            vector=query_vector,
             limit=6
         )
 
@@ -161,8 +158,7 @@ st.subheader("Select KPI Master File")
 
 kpi_file_name = st.selectbox(
     "Select KPI Excel",
-    excel_files,
-    key="kpi_file"
+    excel_files
 )
 
 kpi_df = pd.read_excel(kpi_file_name)
@@ -188,14 +184,7 @@ st.subheader("Select Supporting Files")
 
 schema_file_name = st.selectbox(
     "Select Schema Excel",
-    excel_files,
-    key="schema_file"
-)
-
-data_file_name = st.selectbox(
-    "Select Sample Data Excel (optional)",
-    ["None"] + excel_files,
-    key="data_file"
+    excel_files
 )
 
 # =========================

@@ -80,13 +80,13 @@ def retrieve_regulatory_context(query: str) -> str:
 
     for collection in COLLECTIONS:
 
-        results = qdrant_client.search_points(
+        response = qdrant_client.http.search_api.search_points(
             collection_name=collection,
             vector=query_vector,
             limit=6
         )
 
-        for point in results:
+        for point in response.result:
             txt = (
                 point.payload.get("text")
                 or point.payload.get("document")
